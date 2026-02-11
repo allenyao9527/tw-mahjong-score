@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit_js_eval import streamlit_js_eval  # ✅ 用這個才可把 localStorage 回傳到 Python
 
 APP_VERSION = "v2026-02-11_02_full_debug_1"
 WINDS = ["東", "南", "西", "北"]
@@ -37,59 +37,39 @@ class Settings:
 
 
 # ============================
-# 2) LocalStorage Bridge
+# 2) LocalStorage Bridge (FIXED)
 # ============================
 def _ls_read(key: str) -> str:
-    """Read localStorage[key] from the client and return it (string)."""
-    html = f"""
-    <script>
-      (function() {{
-        const k = {json.dumps(key)};
-        const v = window.localStorage.getItem(k) || "";
-        if (window.Streamlit) {{
-          window.Streamlit.setComponentValue(v);
-          window.Streamlit.setFrameHeight(0);
-        }}
-      }})();
-    </script>
     """
-    val = components.html(html, height=0, key=f"ls_read_{key}_{st.session_state.get('ls_nonce', 0)}")
-    return val or ""
+    ✅ 正確讀取 localStorage，並把值回傳給 Python
+    """
+    v = streamlit_js_eval(
+        js_expressions=f"window.localStorage.getItem({json.dumps(key)})",
+        key=f"LS_GET_{key}",
+    )
+    return v or ""
 
 
 def _ls_write(key: str, value: str) -> None:
-    """Write localStorage[key] = value on the client."""
-    html = f"""
-    <script>
-      (function() {{
-        const k = {json.dumps(key)};
-        const v = {json.dumps(value)};
-        window.localStorage.setItem(k, v);
-        if (window.Streamlit) {{
-          window.Streamlit.setComponentValue("ok");
-          window.Streamlit.setFrameHeight(0);
-        }}
-      }})();
-    </script>
     """
-    components.html(html, height=0, key=f"ls_write_{key}_{st.session_state.get('ls_nonce', 0)}")
+    ✅ 正確寫入 localStorage
+    """
+    js = f"window.localStorage.setItem({json.dumps(key)}, {json.dumps(value)});"
+    streamlit_js_eval(
+        js_expressions=js,
+        key=f"LS_SET_{key}_{st.session_state.get('ls_nonce', 0)}",
+    )
 
 
 def _ls_remove(key: str) -> None:
-    """Remove localStorage[key] on the client."""
-    html = f"""
-    <script>
-      (function() {{
-        const k = {json.dumps(key)};
-        window.localStorage.removeItem(k);
-        if (window.Streamlit) {{
-          window.Streamlit.setComponentValue("ok");
-          window.Streamlit.setFrameHeight(0);
-        }}
-      }})();
-    </script>
     """
-    components.html(html, height=0, key=f"ls_rm_{key}_{st.session_state.get('ls_nonce', 0)}")
+    ✅ 正確刪除 localStorage
+    """
+    js = f"window.localStorage.removeItem({json.dumps(key)});"
+    streamlit_js_eval(
+        js_expressions=js,
+        key=f"LS_RM_{key}_{st.session_state.get('ls_nonce', 0)}",
+    )
 
 
 def snapshot_state() -> Dict[str, Any]:
@@ -333,9 +313,6 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             p_type = ev.get("p_type", "")
             amt = safe_int(ev.get("amount", 0))
 
-            # 罰則換莊規則：
-            # - 莊家有付錢（=莊家犯規）：換下一家
-            # - 非莊家付錢：莊留，dr += 1
             dealer_paid = False
 
             if p_type == "詐胡":
@@ -477,7 +454,7 @@ def page_settings(s: Settings):
         s.dong_cap_total = int(dong_cap)
 
         st.session_state.settings = s
-        autosave()  # ✅ 設定變更也存本機
+        autosave()
         st.success("✅ 已儲存設定")
         st.rerun()
 
@@ -501,7 +478,7 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
                 st.session_state.selected_seat = None
 
             st.session_state.settings = s
-            autosave()  # ✅ 換座位也存
+            autosave()
             st.rerun()
 
     top = st.columns([1, 1.5, 1])
@@ -514,7 +491,6 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
 
 
 def end_current_session(s: Settings):
-    """把目前 events 封存到 sessions，然後清空 events 開新局。"""
     events = st.session_state.events
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, events)
 
@@ -533,13 +509,11 @@ def end_current_session(s: Settings):
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
 
-    autosave()  # ✅ 封存後存本機
+    autosave()
 
 
 def page_record(s: Settings):
     st.header("🀄 牌局錄入")
-
-    # reset 必須在 widgets 建立前
     _apply_reset_flags_before_widgets()
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps = compute_game_state(s, st.session_state.events)
@@ -549,10 +523,8 @@ def page_record(s: Settings):
 
     st.divider()
     render_seat_map(s, sum_df, dealer_seat=ds)
-
     st.divider()
 
-    # ✅ 本機資料管理
     b1, b2, b3 = st.columns([1, 1, 1])
     if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
         if len(st.session_state.events) == 0:
@@ -570,7 +542,6 @@ def page_record(s: Settings):
         st.rerun()
 
     if b3.button("🗑️ 清除本機暫存（全部重置）", use_container_width=True):
-        # 先清 localStorage，再清 session
         st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
         _ls_remove(LOCAL_STORAGE_KEY)
 
@@ -580,15 +551,12 @@ def page_record(s: Settings):
         st.session_state.selected_seat = None
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
-
-        # 讓下一次進來不要再用舊資料 restore
         st.session_state.cloud_loaded = True
         st.rerun()
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
 
     if mode == "一般":
-        # ✅ 有 key 就不要再給 value=
         res = st.selectbox("結果", ["自摸", "放槍", "流局"], key="hand_res")
         tai = st.number_input("台數", min_value=0, step=1, key="hand_tai")
 
@@ -615,8 +583,7 @@ def page_record(s: Settings):
                 }
                 st.session_state.events.append(ev)
                 st.session_state["reset_hand_inputs"] = True
-
-                autosave()  # ✅ 提交就存本機
+                autosave()
                 st.rerun()
 
     else:
@@ -640,8 +607,7 @@ def page_record(s: Settings):
             }
             st.session_state.events.append(ev)
             st.session_state["reset_pen_inputs"] = True
-
-            autosave()  # ✅ 提交就存本機
+            autosave()
             st.rerun()
 
     c1, c2 = st.columns(2)
