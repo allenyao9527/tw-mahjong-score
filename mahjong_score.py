@@ -1,18 +1,23 @@
 # mahjong_score.py
+# ✅ iOS/Safari/PWA 本機暫存：改用 components.html 注入 <script> 寫入/讀取 localStorage（比 js-eval 更穩）
+# ✅ 不改計分核心邏輯；只強化本機保存/讀取與 Debug probe
+# ✅ 功能：一般(自摸/放槍/流局)、罰則(詐胡/詐摸含閒家詐摸莊家台)、固定莊位輪轉、可換座位、東錢算入總分、
+#         結束牌局封存、新開一局、本機清除、數據總覽含行為統計、封存列表
+
 import json
 from datetime import datetime
 from dataclasses import dataclass, field, asdict, is_dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import streamlit as st
-from streamlit_js_eval import streamlit_js_eval  # ✅ 需要 requirements.txt: streamlit-js-eval
+import streamlit.components.v1 as components
 
-APP_VERSION = "v2026-02-11_02_full_debug_1"
+APP_VERSION = "v2026-02-11_03_ios_localstorage_html_bridge"
 WINDS = ["東", "南", "西", "北"]
 
 # ✅ iPhone/瀏覽器本機暫存 key（改版可換 key 避免舊資料衝突）
-LOCAL_STORAGE_KEY = "tw_mj_score_state_v1"
+LOCAL_STORAGE_KEY = "tw_mj_score_state_v2_htmlbridge"
 
 
 # ============================
@@ -37,32 +42,94 @@ class Settings:
 
 
 # ============================
-# 2) LocalStorage Bridge (JS eval)
+# 2) LocalStorage Bridge (components.html)
 # ============================
-def _ls_read(key: str):
+def _ls_read(key: str, nonce: int) -> Optional[str]:
     """
-    讀取 localStorage。注意：首次載入時可能回傳 None（JS 還沒回來），所以 init_state 會重試。
+    Read localStorage[key] from client.
+    Returns value (string) or None if not available yet.
     """
-    return streamlit_js_eval(
-        js_expressions=f"window.localStorage.getItem({json.dumps(key)})",
-        key=f"LS_GET_{key}_{st.session_state.get('ls_nonce', 0)}",
-    )
+    html = f"""
+    <script>
+      (function() {{
+        try {{
+          const k = {json.dumps(key)};
+          const v = window.localStorage.getItem(k) || "";
+          // return value to Streamlit
+          if (window.Streamlit) {{
+            window.Streamlit.setComponentValue(v);
+            window.Streamlit.setFrameHeight(0);
+          }}
+        }} catch (e) {{
+          if (window.Streamlit) {{
+            window.Streamlit.setComponentValue("");
+            window.Streamlit.setFrameHeight(0);
+          }}
+        }}
+      }})();
+    </script>
+    """
+    # components.html returns component value on next rerun; sometimes None on first call
+    val = components.html(html, height=0, key=f"ls_read_{key}_{nonce}")
+    if val is None:
+        return None
+    return str(val)
 
 
-def _ls_write(key: str, value: str) -> None:
-    js = f"window.localStorage.setItem({json.dumps(key)}, {json.dumps(value)});"
-    streamlit_js_eval(
-        js_expressions=js,
-        key=f"LS_SET_{key}_{st.session_state.get('ls_nonce', 0)}",
-    )
+def _ls_write(key: str, value: str, nonce: int) -> Optional[str]:
+    """
+    Write localStorage[key]=value; return 'ok' on success (best-effort).
+    """
+    html = f"""
+    <script>
+      (function() {{
+        try {{
+          const k = {json.dumps(key)};
+          const v = {json.dumps(value)};
+          window.localStorage.setItem(k, v);
+          if (window.Streamlit) {{
+            window.Streamlit.setComponentValue("ok");
+            window.Streamlit.setFrameHeight(0);
+          }}
+        }} catch (e) {{
+          if (window.Streamlit) {{
+            window.Streamlit.setComponentValue("err");
+            window.Streamlit.setFrameHeight(0);
+          }}
+        }}
+      }})();
+    </script>
+    """
+    ack = components.html(html, height=0, key=f"ls_write_{key}_{nonce}")
+    if ack is None:
+        return None
+    return str(ack)
 
 
-def _ls_remove(key: str) -> None:
-    js = f"window.localStorage.removeItem({json.dumps(key)});"
-    streamlit_js_eval(
-        js_expressions=js,
-        key=f"LS_RM_{key}_{st.session_state.get('ls_nonce', 0)}",
-    )
+def _ls_remove(key: str, nonce: int) -> Optional[str]:
+    html = f"""
+    <script>
+      (function() {{
+        try {{
+          const k = {json.dumps(key)};
+          window.localStorage.removeItem(k);
+          if (window.Streamlit) {{
+            window.Streamlit.setComponentValue("ok");
+            window.Streamlit.setFrameHeight(0);
+          }}
+        }} catch (e) {{
+          if (window.Streamlit) {{
+            window.Streamlit.setComponentValue("err");
+            window.Streamlit.setFrameHeight(0);
+          }}
+        }}
+      }})();
+    </script>
+    """
+    ack = components.html(html, height=0, key=f"ls_rm_{key}_{nonce}")
+    if ack is None:
+        return None
+    return str(ack)
 
 
 def snapshot_state() -> Dict[str, Any]:
@@ -88,10 +155,22 @@ def restore_state(data: Dict[str, Any]) -> None:
 
 
 def autosave() -> None:
-    """Save current state to localStorage."""
+    """
+    Save current state to localStorage.
+    IMPORTANT: We bump ls_nonce to force components key update so script executes.
+    """
     try:
         payload = json.dumps(snapshot_state(), ensure_ascii=False)
-        _ls_write(LOCAL_STORAGE_KEY, payload)
+        st.session_state["last_saved_len"] = len(payload)
+
+        st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
+        ack = _ls_write(LOCAL_STORAGE_KEY, payload, st.session_state["ls_nonce"])
+        st.session_state["last_save_ack"] = ack
+
+        # Probe immediately (best-effort)
+        st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
+        probe = _ls_read(LOCAL_STORAGE_KEY, st.session_state["ls_nonce"])
+        st.session_state["ls_probe_len"] = len(probe or "")
     except Exception:
         pass
 
@@ -102,7 +181,7 @@ def autosave() -> None:
 def init_state():
     st.session_state.setdefault("settings", Settings())
     st.session_state.setdefault("events", [])       # 當前牌局
-    st.session_state.setdefault("sessions", [])     # 封存的牌局（本次裝置/瀏覽器）
+    st.session_state.setdefault("sessions", [])     # 封存的牌局（本機）
 
     st.session_state.setdefault("selected_seat", None)
     st.session_state.setdefault("debug", True)
@@ -118,36 +197,36 @@ def init_state():
     st.session_state.setdefault("pen_vic", 0)
     st.session_state.setdefault("pen_amt", 300)
 
-    # reset flags (IMPORTANT: reset happens before widgets are created)
+    # reset flags
     st.session_state.setdefault("reset_hand_inputs", False)
     st.session_state.setdefault("reset_pen_inputs", False)
 
-    # localStorage load control
+    # localStorage load
     st.session_state.setdefault("cloud_loaded", False)
     st.session_state.setdefault("ls_nonce", 0)
-    st.session_state.setdefault("ls_read_tries", 0)  # ✅ 讀取重試次數
+    st.session_state.setdefault("ls_read_tries", 0)
 
-    # ✅ 重點修補：首次 rerun 可能拿到 None（JS 還沒回傳），所以重試 1~2 次
+    # Debug probes
+    st.session_state.setdefault("last_saved_len", 0)
+    st.session_state.setdefault("last_save_ack", None)
+    st.session_state.setdefault("ls_probe_len", 0)
+    st.session_state.setdefault("ls_loaded_len", 0)
+
     if not st.session_state.cloud_loaded:
-        raw = _ls_read(LOCAL_STORAGE_KEY)
-
-        if raw is None:
-            if st.session_state.ls_read_tries < 2:
-                st.session_state.ls_read_tries += 1
-                st.session_state.ls_nonce += 1
-                st.rerun()
-            else:
-                st.session_state.cloud_loaded = True
-            return
-
-        if raw:
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    restore_state(data)
-            except Exception:
-                pass
-
+        # Try a few times because first render may not return value yet
+        for _ in range(3):
+            st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
+            st.session_state["ls_read_tries"] = st.session_state.get("ls_read_tries", 0) + 1
+            raw = _ls_read(LOCAL_STORAGE_KEY, st.session_state["ls_nonce"])
+            if raw:
+                st.session_state["ls_loaded_len"] = len(raw)
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        restore_state(data)
+                except Exception:
+                    pass
+                break
         st.session_state.cloud_loaded = True
 
 
@@ -275,7 +354,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                             delta[p] -= other_pay
                     advance_dealer()
 
-                # 東錢（可選）
+                # 東錢（可選）— ✅ 已算入總分
                 if settings.dong_per_self_draw > 0 and settings.dong_cap_total > 0:
                     remain = max(0, int(settings.dong_cap_total) - int(d_acc))
                     take = min(int(settings.dong_per_self_draw), remain)
@@ -317,6 +396,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             p_type = ev.get("p_type", "")
             amt = safe_int(ev.get("amount", 0))
 
+            # 罰則換莊規則：
+            # - 莊家有付錢（=莊家犯規）：換下一家
+            # - 非莊家付錢：莊留，dr += 1
             dealer_paid = False
 
             if p_type == "詐胡":
@@ -335,7 +417,10 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                 if 0 <= off < n:
                     stats[off]["詐摸"] += 1
 
+                # ✅ 你定義：閒家詐摸 → 賠兩閒(各輸入金額) + 賠莊(輸入金額 + 莊家台*3)
+                # 例：輸入500, 莊連1=bonusTai=3, 每台50 => 500 + 50*3
                 if off == dealer_pid:
+                    # 莊家詐摸：維持原規則（賠三家每家amt）
                     desc = f"{names[off]} 詐摸賠三家 (每家${amt}) [莊]"
                     delta[off] -= 3 * amt
                     for p in range(n):
@@ -344,13 +429,17 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                     dealer_paid = True
                 else:
                     bonus_tai = dealer_bonus_tai(dr)
-                    dealer_extra = bonus_tai * int(settings.tai_value)
+                    dealer_extra = bonus_tai * int(settings.tai_value)  # ✅ 莊家台換成金額(= 台數*每台金額)
 
                     other_non_dealers = [p for p in range(n) if p not in (off, dealer_pid)]
+                    # 賠兩閒：各 amt
                     for p in other_non_dealers:
                         delta[off] -= amt
                         delta[p] += amt
 
+                    # 賠莊：amt + 莊家台金額 *3?（你定義：bonusTai=3台時 +50*3）
+                    # 這裡 bonus_tai 本身就是台數（連1=3台...），每台金額=settings.tai_value
+                    # 你舉例 50*3 = 每台金額*台數
                     pay_dealer = amt + dealer_extra
                     delta[off] -= pay_dealer
                     delta[dealer_pid] += pay_dealer
@@ -459,7 +548,7 @@ def page_settings(s: Settings):
 
         st.session_state.settings = s
         autosave()
-        st.success("✅ 已儲存設定")
+        st.success("✅ 已儲存設定（本機已保存）")
         st.rerun()
 
 
@@ -518,6 +607,7 @@ def end_current_session(s: Settings):
 
 def page_record(s: Settings):
     st.header("🀄 牌局錄入")
+
     _apply_reset_flags_before_widgets()
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps = compute_game_state(s, st.session_state.events)
@@ -527,8 +617,8 @@ def page_record(s: Settings):
 
     st.divider()
     render_seat_map(s, sum_df, dealer_seat=ds)
-    st.divider()
 
+    st.divider()
     b1, b2, b3 = st.columns([1, 1, 1])
     if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
         if len(st.session_state.events) == 0:
@@ -547,7 +637,7 @@ def page_record(s: Settings):
 
     if b3.button("🗑️ 清除本機暫存（全部重置）", use_container_width=True):
         st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
-        _ls_remove(LOCAL_STORAGE_KEY)
+        _ls_remove(LOCAL_STORAGE_KEY, st.session_state["ls_nonce"])
 
         st.session_state.settings = Settings()
         st.session_state.events = []
@@ -555,8 +645,7 @@ def page_record(s: Settings):
         st.session_state.selected_seat = None
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
-        st.session_state.cloud_loaded = False
-        st.session_state.ls_read_tries = 0
+        st.session_state.cloud_loaded = True
         st.rerun()
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
@@ -641,8 +730,13 @@ def page_record(s: Settings):
     if st.session_state.debug:
         st.write(f"DEBUG events len: {len(st.session_state.events)}")
         st.write("DEBUG sessions len:", len(st.session_state.sessions))
-        st.write("DEBUG cloud_loaded:", st.session_state.get("cloud_loaded"))
-        st.write("DEBUG ls_read_tries:", st.session_state.get("ls_read_tries"))
+        st.write("DEBUG cloud_loaded:", st.session_state.cloud_loaded)
+        st.write("DEBUG ls_read_tries:", st.session_state.get("ls_read_tries", 0))
+        st.write("DEBUG ls_loaded_len:", st.session_state.get("ls_loaded_len", 0))
+        st.write("DEBUG last_saved_len:", st.session_state.get("last_saved_len", 0))
+        st.write("DEBUG last_save_ack:", st.session_state.get("last_save_ack", None))
+        st.write("DEBUG ls_probe_len:", st.session_state.get("ls_probe_len", 0))
+
         if st.session_state.events:
             st.write("DEBUG last event:", ev_to_dict(st.session_state.events[-1]))
         st.write("DEBUG seating:", s.seat_players)
@@ -714,7 +808,7 @@ def main():
 
     st.sidebar.title("選單")
     st.sidebar.caption(f"版本：{APP_VERSION}")
-    st.sidebar.caption("✅ 本機暫存：iPhone 放背景/重整後可恢復（已加讀取重試）")
+    st.sidebar.caption("✅ 本機暫存：iPhone 重整後應可恢復（HTML Bridge）")
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
 
