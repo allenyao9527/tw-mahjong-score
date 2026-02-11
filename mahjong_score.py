@@ -1,12 +1,18 @@
 # mahjong_score.py
-import streamlit as st
-import pandas as pd
+import json
+from datetime import datetime
 from dataclasses import dataclass, field, asdict, is_dataclass
 from typing import List, Dict, Any
-from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
 
 APP_VERSION = "v2026-02-11_02_full_debug_1"
 WINDS = ["東", "南", "西", "北"]
+
+# ✅ iPhone/瀏覽器本機暫存 key（改版可換 key 避免舊資料衝突）
+LOCAL_STORAGE_KEY = "tw_mj_score_state_v1"
 
 
 # ============================
@@ -17,7 +23,8 @@ class Settings:
     base: int = 300
     tai_value: int = 100
 
-    players: List[str] = field(default_factory=lambda: ["Allen", "Bella", "9C", "阿顏"])
+    # ✅ 預設玩家
+    players: List[str] = field(default_factory=lambda: ["玩家1", "玩家2", "玩家3", "玩家4"])
     # seat_players[seat_idx] = player_id, seat_idx: 0=東 1=南 2=西 3=北
     seat_players: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
 
@@ -30,12 +37,101 @@ class Settings:
 
 
 # ============================
-# 2) State / Helpers
+# 2) LocalStorage Bridge
+# ============================
+def _ls_read(key: str) -> str:
+    """Read localStorage[key] from the client and return it (string)."""
+    html = f"""
+    <script>
+      (function() {{
+        const k = {json.dumps(key)};
+        const v = window.localStorage.getItem(k) || "";
+        if (window.Streamlit) {{
+          window.Streamlit.setComponentValue(v);
+          window.Streamlit.setFrameHeight(0);
+        }}
+      }})();
+    </script>
+    """
+    val = components.html(html, height=0, key=f"ls_read_{key}_{st.session_state.get('ls_nonce', 0)}")
+    return val or ""
+
+
+def _ls_write(key: str, value: str) -> None:
+    """Write localStorage[key] = value on the client."""
+    html = f"""
+    <script>
+      (function() {{
+        const k = {json.dumps(key)};
+        const v = {json.dumps(value)};
+        window.localStorage.setItem(k, v);
+        if (window.Streamlit) {{
+          window.Streamlit.setComponentValue("ok");
+          window.Streamlit.setFrameHeight(0);
+        }}
+      }})();
+    </script>
+    """
+    components.html(html, height=0, key=f"ls_write_{key}_{st.session_state.get('ls_nonce', 0)}")
+
+
+def _ls_remove(key: str) -> None:
+    """Remove localStorage[key] on the client."""
+    html = f"""
+    <script>
+      (function() {{
+        const k = {json.dumps(key)};
+        window.localStorage.removeItem(k);
+        if (window.Streamlit) {{
+          window.Streamlit.setComponentValue("ok");
+          window.Streamlit.setFrameHeight(0);
+        }}
+      }})();
+    </script>
+    """
+    components.html(html, height=0, key=f"ls_rm_{key}_{st.session_state.get('ls_nonce', 0)}")
+
+
+def snapshot_state() -> Dict[str, Any]:
+    s = st.session_state.settings
+    settings_dict = asdict(s) if is_dataclass(s) else dict(s)
+    return {
+        "settings": settings_dict,
+        "events": st.session_state.get("events", []),
+        "sessions": st.session_state.get("sessions", []),
+    }
+
+
+def restore_state(data: Dict[str, Any]) -> None:
+    if not data:
+        return
+    if isinstance(data.get("settings"), dict):
+        try:
+            st.session_state.settings = Settings(**data["settings"])
+        except Exception:
+            # schema mismatch fallback
+            st.session_state.settings = Settings()
+    st.session_state.events = data.get("events", []) or []
+    st.session_state.sessions = data.get("sessions", []) or []
+
+
+def autosave() -> None:
+    """Save current state to localStorage."""
+    try:
+        payload = json.dumps(snapshot_state(), ensure_ascii=False)
+        _ls_write(LOCAL_STORAGE_KEY, payload)
+    except Exception:
+        # 不要讓存檔失敗影響主流程
+        pass
+
+
+# ============================
+# 3) State / Helpers
 # ============================
 def init_state():
     st.session_state.setdefault("settings", Settings())
     st.session_state.setdefault("events", [])       # 當前牌局
-    st.session_state.setdefault("sessions", [])     # 封存的牌局（本次執行）
+    st.session_state.setdefault("sessions", [])     # 封存的牌局（本次裝置/瀏覽器）
 
     st.session_state.setdefault("selected_seat", None)
     st.session_state.setdefault("debug", True)
@@ -54,6 +150,21 @@ def init_state():
     # reset flags (IMPORTANT: reset happens before widgets are created)
     st.session_state.setdefault("reset_hand_inputs", False)
     st.session_state.setdefault("reset_pen_inputs", False)
+
+    # localStorage load-once
+    st.session_state.setdefault("cloud_loaded", False)
+    st.session_state.setdefault("ls_nonce", 0)
+
+    if not st.session_state.cloud_loaded:
+        raw = _ls_read(LOCAL_STORAGE_KEY)
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    restore_state(data)
+            except Exception:
+                pass
+        st.session_state.cloud_loaded = True
 
 
 def safe_int(x, default=0) -> int:
@@ -103,7 +214,7 @@ def normalize_events(events: List[Any]) -> List[Dict[str, Any]]:
 
 
 # ============================
-# 3) Core compute
+# 4) Core compute
 # ============================
 def compute_game_state(settings: Settings, events_raw: List[Any]):
     events = normalize_events(events_raw)
@@ -324,7 +435,7 @@ def _apply_reset_flags_before_widgets():
 
 
 # ============================
-# 4) UI
+# 5) UI
 # ============================
 def page_settings(s: Settings):
     st.header("⚙️ 設定")
@@ -340,7 +451,7 @@ def page_settings(s: Settings):
         tai_value = c2.number_input("每台金額", min_value=0, value=int(s.tai_value), step=10)
 
         st.divider()
-        s.draw_keeps_dealer = st.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
+        draw_keep = st.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
 
         st.divider()
         st.subheader("東（可選）")
@@ -360,10 +471,13 @@ def page_settings(s: Settings):
         s.players = new_players
         s.base = int(base)
         s.tai_value = int(tai_value)
+        s.draw_keeps_dealer = bool(draw_keep)
         s.host_player_id = int(host)
         s.dong_per_self_draw = int(dong_x)
         s.dong_cap_total = int(dong_cap)
+
         st.session_state.settings = s
+        autosave()  # ✅ 設定變更也存本機
         st.success("✅ 已儲存設定")
         st.rerun()
 
@@ -385,7 +499,9 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
                 o = st.session_state.selected_seat
                 s.seat_players[o], s.seat_players[seat_idx] = s.seat_players[seat_idx], s.seat_players[o]
                 st.session_state.selected_seat = None
+
             st.session_state.settings = s
+            autosave()  # ✅ 換座位也存
             st.rerun()
 
     top = st.columns([1, 1.5, 1])
@@ -406,7 +522,7 @@ def end_current_session(s: Settings):
     session = {
         "ended_at": stamp,
         "event_count": len(events),
-        "dong_total": int(d_acc),  # ✅ 把本場東錢總額也封存
+        "dong_total": int(d_acc),
         "sum_df": sum_df.to_dict(orient="records"),
         "stats_df": stats_df.to_dict(orient="records"),
         "ledger_tail": ledger_df.tail(20).to_dict(orient="records"),
@@ -417,10 +533,13 @@ def end_current_session(s: Settings):
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
 
+    autosave()  # ✅ 封存後存本機
+
 
 def page_record(s: Settings):
     st.header("🀄 牌局錄入")
 
+    # reset 必須在 widgets 建立前
     _apply_reset_flags_before_widgets()
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps = compute_game_state(s, st.session_state.events)
@@ -433,20 +552,43 @@ def page_record(s: Settings):
 
     st.divider()
 
-    # ✅ 新增：結束牌局
-    c_end1, c_end2 = st.columns([1, 2])
-    if c_end1.button("🏁 結束牌局（封存統計並開新局）", use_container_width=True):
+    # ✅ 本機資料管理
+    b1, b2, b3 = st.columns([1, 1, 1])
+    if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
         if len(st.session_state.events) == 0:
             st.warning("目前沒有事件，無需結束。")
         else:
             end_current_session(s)
-            st.success("已封存本局統計，並開始新局（events 已清空）。")
+            st.success("已封存本局並開始新局（本機已保存）。")
             st.rerun()
+
+    if b2.button("🧹 清空本局（保留封存）", use_container_width=True):
+        st.session_state.events = []
+        st.session_state["reset_hand_inputs"] = True
+        st.session_state["reset_pen_inputs"] = True
+        autosave()
+        st.rerun()
+
+    if b3.button("🗑️ 清除本機暫存（全部重置）", use_container_width=True):
+        # 先清 localStorage，再清 session
+        st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
+        _ls_remove(LOCAL_STORAGE_KEY)
+
+        st.session_state.settings = Settings()
+        st.session_state.events = []
+        st.session_state.sessions = []
+        st.session_state.selected_seat = None
+        st.session_state["reset_hand_inputs"] = True
+        st.session_state["reset_pen_inputs"] = True
+
+        # 讓下一次進來不要再用舊資料 restore
+        st.session_state.cloud_loaded = True
+        st.rerun()
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
 
     if mode == "一般":
-        # ✅ 有 key 就不要再給 value=（避免你看到的警告）
+        # ✅ 有 key 就不要再給 value=
         res = st.selectbox("結果", ["自摸", "放槍", "流局"], key="hand_res")
         tai = st.number_input("台數", min_value=0, step=1, key="hand_tai")
 
@@ -473,6 +615,8 @@ def page_record(s: Settings):
                 }
                 st.session_state.events.append(ev)
                 st.session_state["reset_hand_inputs"] = True
+
+                autosave()  # ✅ 提交就存本機
                 st.rerun()
 
     else:
@@ -483,7 +627,6 @@ def page_record(s: Settings):
         if pt == "詐胡":
             vic = st.selectbox("賠付對象", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="pen_vic")
 
-        # ✅ 有 key 就不要再給 value=
         amt = st.number_input("金額", min_value=0, step=50, key="pen_amt")
 
         submit = st.button("🚨 提交罰則", use_container_width=True)
@@ -497,21 +640,26 @@ def page_record(s: Settings):
             }
             st.session_state.events.append(ev)
             st.session_state["reset_pen_inputs"] = True
+
+            autosave()  # ✅ 提交就存本機
             st.rerun()
 
     c1, c2 = st.columns(2)
     if c1.button("🔙 撤銷上一筆", use_container_width=True):
         if st.session_state.events:
             st.session_state.events.pop()
+            autosave()
             st.rerun()
-    if c2.button("🧹 清空全部", use_container_width=True):
+    if c2.button("🧹 清空全部（本局+封存）", use_container_width=True):
         st.session_state.events = []
+        st.session_state.sessions = []
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
+        autosave()
         st.rerun()
 
     st.divider()
-    st.info(f"💰 累計東錢：${int(d_acc)}")
+    st.info(f"💰 累計東錢：${int(d_acc)}（已算入總分）")
 
     if not ledger_df.empty:
         st.dataframe(ledger_df, hide_index=True, use_container_width=True)
@@ -546,7 +694,7 @@ def page_overview(s: Settings):
         st.dataframe(ledger_df, hide_index=True, use_container_width=True)
 
     st.divider()
-    st.subheader("已結束的牌局（封存）")
+    st.subheader("已結束的牌局（封存，本機保存）")
 
     if not st.session_state.sessions:
         st.caption("尚無封存的牌局。你可以在「牌局錄入」按『結束牌局』。")
@@ -583,7 +731,7 @@ def page_overview(s: Settings):
 
 
 # ============================
-# 5) App
+# 6) App
 # ============================
 def main():
     st.set_page_config(layout="wide", page_title="麻將計分系統")
@@ -593,6 +741,7 @@ def main():
 
     st.sidebar.title("選單")
     st.sidebar.caption(f"版本：{APP_VERSION}")
+    st.sidebar.caption("✅ 本機暫存：iPhone 放背景/重整後可恢復")
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
 
