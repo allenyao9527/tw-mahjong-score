@@ -1,9 +1,4 @@
 # mahjong_score.py
-# ✅ iOS/Safari/PWA 本機暫存：改用 components.html 注入 <script> 寫入/讀取 localStorage（比 js-eval 更穩）
-# ✅ 不改計分核心邏輯；只強化本機保存/讀取與 Debug probe
-# ✅ 功能：一般(自摸/放槍/流局)、罰則(詐胡/詐摸含閒家詐摸莊家台)、固定莊位輪轉、可換座位、東錢算入總分、
-#         結束牌局封存、新開一局、本機清除、數據總覽含行為統計、封存列表
-
 import json
 from datetime import datetime
 from dataclasses import dataclass, field, asdict, is_dataclass
@@ -13,10 +8,9 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-APP_VERSION = "v2026-02-11_03_ios_localstorage_html_bridge"
+APP_VERSION = "v2026-02-11_04_ios_ls_fix_streamlit_cloud"
 WINDS = ["東", "南", "西", "北"]
 
-# ✅ iPhone/瀏覽器本機暫存 key（改版可換 key 避免舊資料衝突）
 LOCAL_STORAGE_KEY = "tw_mj_score_state_v2_htmlbridge"
 
 
@@ -28,26 +22,23 @@ class Settings:
     base: int = 300
     tai_value: int = 100
 
-    # ✅ 預設玩家
     players: List[str] = field(default_factory=lambda: ["玩家1", "玩家2", "玩家3", "玩家4"])
-    # seat_players[seat_idx] = player_id, seat_idx: 0=東 1=南 2=西 3=北
     seat_players: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
 
     draw_keeps_dealer: bool = True
 
-    # 東錢（可選）
     host_player_id: int = 0
     dong_per_self_draw: int = 0
     dong_cap_total: int = 0
 
 
 # ============================
-# 2) LocalStorage Bridge (components.html)
+# 2) LocalStorage Bridge (safe)
 # ============================
 def _ls_read(key: str, nonce: int) -> Optional[str]:
     """
     Read localStorage[key] from client.
-    Returns value (string) or None if not available yet.
+    On Streamlit Cloud/iOS some timings can fail; must be best-effort.
     """
     html = f"""
     <script>
@@ -55,7 +46,6 @@ def _ls_read(key: str, nonce: int) -> Optional[str]:
         try {{
           const k = {json.dumps(key)};
           const v = window.localStorage.getItem(k) || "";
-          // return value to Streamlit
           if (window.Streamlit) {{
             window.Streamlit.setComponentValue(v);
             window.Streamlit.setFrameHeight(0);
@@ -69,17 +59,17 @@ def _ls_read(key: str, nonce: int) -> Optional[str]:
       }})();
     </script>
     """
-    # components.html returns component value on next rerun; sometimes None on first call
-    val = components.html(html, height=0, key=f"ls_read_{key}_{nonce}")
-    if val is None:
+    try:
+        val = components.html(html, height=0, key=f"ls_read_{key}_{nonce}")
+        if val is None:
+            return None
+        return str(val)
+    except Exception as e:
+        st.session_state["ls_last_error"] = f"ls_read_error: {type(e).__name__}"
         return None
-    return str(val)
 
 
 def _ls_write(key: str, value: str, nonce: int) -> Optional[str]:
-    """
-    Write localStorage[key]=value; return 'ok' on success (best-effort).
-    """
     html = f"""
     <script>
       (function() {{
@@ -100,10 +90,14 @@ def _ls_write(key: str, value: str, nonce: int) -> Optional[str]:
       }})();
     </script>
     """
-    ack = components.html(html, height=0, key=f"ls_write_{key}_{nonce}")
-    if ack is None:
+    try:
+        ack = components.html(html, height=0, key=f"ls_write_{key}_{nonce}")
+        if ack is None:
+            return None
+        return str(ack)
+    except Exception as e:
+        st.session_state["ls_last_error"] = f"ls_write_error: {type(e).__name__}"
         return None
-    return str(ack)
 
 
 def _ls_remove(key: str, nonce: int) -> Optional[str]:
@@ -126,10 +120,14 @@ def _ls_remove(key: str, nonce: int) -> Optional[str]:
       }})();
     </script>
     """
-    ack = components.html(html, height=0, key=f"ls_rm_{key}_{nonce}")
-    if ack is None:
+    try:
+        ack = components.html(html, height=0, key=f"ls_rm_{key}_{nonce}")
+        if ack is None:
+            return None
+        return str(ack)
+    except Exception as e:
+        st.session_state["ls_last_error"] = f"ls_remove_error: {type(e).__name__}"
         return None
-    return str(ack)
 
 
 def snapshot_state() -> Dict[str, Any]:
@@ -156,8 +154,7 @@ def restore_state(data: Dict[str, Any]) -> None:
 
 def autosave() -> None:
     """
-    Save current state to localStorage.
-    IMPORTANT: We bump ls_nonce to force components key update so script executes.
+    Best-effort save to localStorage.
     """
     try:
         payload = json.dumps(snapshot_state(), ensure_ascii=False)
@@ -167,7 +164,7 @@ def autosave() -> None:
         ack = _ls_write(LOCAL_STORAGE_KEY, payload, st.session_state["ls_nonce"])
         st.session_state["last_save_ack"] = ack
 
-        # Probe immediately (best-effort)
+        # Optional probe (best-effort)
         st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
         probe = _ls_read(LOCAL_STORAGE_KEY, st.session_state["ls_nonce"])
         st.session_state["ls_probe_len"] = len(probe or "")
@@ -175,18 +172,44 @@ def autosave() -> None:
         pass
 
 
+def try_restore_from_local_storage():
+    """
+    ✅ IMPORTANT:
+    Do NOT run inside init_state() on Streamlit Cloud.
+    Run after page render starts (safe timing), and only once.
+    """
+    if st.session_state.get("cloud_loaded", False):
+        return
+
+    st.session_state.setdefault("ls_read_tries", 0)
+    for _ in range(3):
+        st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
+        st.session_state["ls_read_tries"] += 1
+        raw = _ls_read(LOCAL_STORAGE_KEY, st.session_state["ls_nonce"])
+        if raw:
+            st.session_state["ls_loaded_len"] = len(raw)
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    restore_state(data)
+            except Exception:
+                pass
+            break
+
+    st.session_state["cloud_loaded"] = True
+
+
 # ============================
 # 3) State / Helpers
 # ============================
 def init_state():
     st.session_state.setdefault("settings", Settings())
-    st.session_state.setdefault("events", [])       # 當前牌局
-    st.session_state.setdefault("sessions", [])     # 封存的牌局（本機）
+    st.session_state.setdefault("events", [])
+    st.session_state.setdefault("sessions", [])
 
     st.session_state.setdefault("selected_seat", None)
     st.session_state.setdefault("debug", True)
 
-    # UI state (reactive widgets keys)
     st.session_state.setdefault("hand_res", "自摸")
     st.session_state.setdefault("hand_tai", 0)
     st.session_state.setdefault("hand_win", 0)
@@ -197,11 +220,10 @@ def init_state():
     st.session_state.setdefault("pen_vic", 0)
     st.session_state.setdefault("pen_amt", 300)
 
-    # reset flags
     st.session_state.setdefault("reset_hand_inputs", False)
     st.session_state.setdefault("reset_pen_inputs", False)
 
-    # localStorage load
+    # ✅ 延遲載入 localStorage：不要在 init_state 直接讀（Streamlit Cloud 會炸）
     st.session_state.setdefault("cloud_loaded", False)
     st.session_state.setdefault("ls_nonce", 0)
     st.session_state.setdefault("ls_read_tries", 0)
@@ -211,23 +233,7 @@ def init_state():
     st.session_state.setdefault("last_save_ack", None)
     st.session_state.setdefault("ls_probe_len", 0)
     st.session_state.setdefault("ls_loaded_len", 0)
-
-    if not st.session_state.cloud_loaded:
-        # Try a few times because first render may not return value yet
-        for _ in range(3):
-            st.session_state["ls_nonce"] = st.session_state.get("ls_nonce", 0) + 1
-            st.session_state["ls_read_tries"] = st.session_state.get("ls_read_tries", 0) + 1
-            raw = _ls_read(LOCAL_STORAGE_KEY, st.session_state["ls_nonce"])
-            if raw:
-                st.session_state["ls_loaded_len"] = len(raw)
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, dict):
-                        restore_state(data)
-                except Exception:
-                    pass
-                break
-        st.session_state.cloud_loaded = True
+    st.session_state.setdefault("ls_last_error", "")
 
 
 def safe_int(x, default=0) -> int:
@@ -242,10 +248,6 @@ def amount_A(settings: Settings, tai: int) -> int:
 
 
 def dealer_bonus_tai(dealer_run: int) -> int:
-    """
-    上莊=1台, 連1=3台, 連2=5台, 連3=7台
-    => bonus = 1 + 2*dealer_run
-    """
     return 1 + 2 * int(dealer_run)
 
 
@@ -289,7 +291,6 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
     cum = [0] * n
     rows = []
 
-    # 狀態：圈風、莊位(座位idx)、連莊、東錢累積
     rw, ds, dr, d_acc = 0, 0, 0, 0
     debug_steps = []
 
@@ -354,7 +355,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                             delta[p] -= other_pay
                     advance_dealer()
 
-                # 東錢（可選）— ✅ 已算入總分
+                # 東錢（可選）—已算入總分
                 if settings.dong_per_self_draw > 0 and settings.dong_cap_total > 0:
                     remain = max(0, int(settings.dong_cap_total) - int(d_acc))
                     take = min(int(settings.dong_per_self_draw), remain)
@@ -396,9 +397,6 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             p_type = ev.get("p_type", "")
             amt = safe_int(ev.get("amount", 0))
 
-            # 罰則換莊規則：
-            # - 莊家有付錢（=莊家犯規）：換下一家
-            # - 非莊家付錢：莊留，dr += 1
             dealer_paid = False
 
             if p_type == "詐胡":
@@ -406,7 +404,6 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                 vic = safe_int(ev.get("victim_id", 0))
                 if 0 <= off < n:
                     stats[off]["詐胡"] += 1
-
                 desc = f"{names[off]} 詐胡→{names[vic]} (${amt})"
                 delta[off] -= amt
                 delta[vic] += amt
@@ -417,10 +414,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                 if 0 <= off < n:
                     stats[off]["詐摸"] += 1
 
-                # ✅ 你定義：閒家詐摸 → 賠兩閒(各輸入金額) + 賠莊(輸入金額 + 莊家台*3)
-                # 例：輸入500, 莊連1=bonusTai=3, 每台50 => 500 + 50*3
                 if off == dealer_pid:
-                    # 莊家詐摸：維持原規則（賠三家每家amt）
                     desc = f"{names[off]} 詐摸賠三家 (每家${amt}) [莊]"
                     delta[off] -= 3 * amt
                     for p in range(n):
@@ -429,17 +423,13 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                     dealer_paid = True
                 else:
                     bonus_tai = dealer_bonus_tai(dr)
-                    dealer_extra = bonus_tai * int(settings.tai_value)  # ✅ 莊家台換成金額(= 台數*每台金額)
+                    dealer_extra = bonus_tai * int(settings.tai_value)
 
                     other_non_dealers = [p for p in range(n) if p not in (off, dealer_pid)]
-                    # 賠兩閒：各 amt
                     for p in other_non_dealers:
                         delta[off] -= amt
                         delta[p] += amt
 
-                    # 賠莊：amt + 莊家台金額 *3?（你定義：bonusTai=3台時 +50*3）
-                    # 這裡 bonus_tai 本身就是台數（連1=3台...），每台金額=settings.tai_value
-                    # 你舉例 50*3 = 每台金額*台數
                     pay_dealer = amt + dealer_extra
                     delta[off] -= pay_dealer
                     delta[dealer_pid] += pay_dealer
@@ -453,10 +443,8 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                 desc = f"未知罰則類型：{p_type}"
 
             if dealer_paid:
-                debug_steps.append(f"[#{idx}] penalty: dealer_paid=True -> advance dealer")
                 advance_dealer()
             else:
-                debug_steps.append(f"[#{idx}] penalty: dealer_paid=False -> dealer_run +1")
                 dr += 1
 
         else:
@@ -508,6 +496,8 @@ def _apply_reset_flags_before_widgets():
 # 5) UI
 # ============================
 def page_settings(s: Settings):
+    try_restore_from_local_storage()
+
     st.header("⚙️ 設定")
     st.caption(f"版本：{APP_VERSION}")
 
@@ -601,13 +591,13 @@ def end_current_session(s: Settings):
     st.session_state.events = []
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
-
     autosave()
 
 
 def page_record(s: Settings):
-    st.header("🀄 牌局錄入")
+    try_restore_from_local_storage()
 
+    st.header("🀄 牌局錄入")
     _apply_reset_flags_before_widgets()
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps = compute_game_state(s, st.session_state.events)
@@ -620,6 +610,7 @@ def page_record(s: Settings):
 
     st.divider()
     b1, b2, b3 = st.columns([1, 1, 1])
+
     if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
         if len(st.session_state.events) == 0:
             st.warning("目前沒有事件，無需結束。")
@@ -645,7 +636,7 @@ def page_record(s: Settings):
         st.session_state.selected_seat = None
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
-        st.session_state.cloud_loaded = True
+        st.session_state["cloud_loaded"] = True
         st.rerun()
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
@@ -659,7 +650,6 @@ def page_record(s: Settings):
 
         if res in ("自摸", "放槍"):
             win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_win")
-
         if res == "放槍":
             lose = st.selectbox("放槍家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_lose")
 
@@ -668,13 +658,7 @@ def page_record(s: Settings):
             if res == "放槍" and int(win) == int(lose):
                 st.error("放槍時：贏家與放槍家不能相同")
             else:
-                ev = {
-                    "_type": "hand",
-                    "result": res,
-                    "winner_id": int(win),
-                    "loser_id": int(lose),
-                    "tai": int(tai),
-                }
+                ev = {"_type": "hand", "result": res, "winner_id": int(win), "loser_id": int(lose), "tai": int(tai)}
                 st.session_state.events.append(ev)
                 st.session_state["reset_hand_inputs"] = True
                 autosave()
@@ -692,13 +676,7 @@ def page_record(s: Settings):
 
         submit = st.button("🚨 提交罰則", use_container_width=True)
         if submit:
-            ev = {
-                "_type": "penalty",
-                "p_type": pt,
-                "offender_id": int(off),
-                "victim_id": int(vic),
-                "amount": int(amt),
-            }
+            ev = {"_type": "penalty", "p_type": pt, "offender_id": int(off), "victim_id": int(vic), "amount": int(amt)}
             st.session_state.events.append(ev)
             st.session_state["reset_pen_inputs"] = True
             autosave()
@@ -710,6 +688,7 @@ def page_record(s: Settings):
             st.session_state.events.pop()
             autosave()
             st.rerun()
+
     if c2.button("🧹 清空全部（本局+封存）", use_container_width=True):
         st.session_state.events = []
         st.session_state.sessions = []
@@ -730,15 +709,17 @@ def page_record(s: Settings):
     if st.session_state.debug:
         st.write(f"DEBUG events len: {len(st.session_state.events)}")
         st.write("DEBUG sessions len:", len(st.session_state.sessions))
-        st.write("DEBUG cloud_loaded:", st.session_state.cloud_loaded)
+        st.write("DEBUG cloud_loaded:", st.session_state.get("cloud_loaded"))
         st.write("DEBUG ls_read_tries:", st.session_state.get("ls_read_tries", 0))
         st.write("DEBUG ls_loaded_len:", st.session_state.get("ls_loaded_len", 0))
         st.write("DEBUG last_saved_len:", st.session_state.get("last_saved_len", 0))
         st.write("DEBUG last_save_ack:", st.session_state.get("last_save_ack", None))
         st.write("DEBUG ls_probe_len:", st.session_state.get("ls_probe_len", 0))
+        st.write("DEBUG ls_last_error:", st.session_state.get("ls_last_error", ""))
 
         if st.session_state.events:
             st.write("DEBUG last event:", ev_to_dict(st.session_state.events[-1]))
+
         st.write("DEBUG seating:", s.seat_players)
         st.write("DEBUG players:", s.players)
         st.write("DEBUG steps (last 30):")
@@ -746,8 +727,9 @@ def page_record(s: Settings):
 
 
 def page_overview(s: Settings):
-    st.header("📊 數據總覽")
+    try_restore_from_local_storage()
 
+    st.header("📊 數據總覽")
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, st.session_state.events)
     merged = pd.merge(sum_df, stats_df, on="玩家", how="left")
 
@@ -769,32 +751,12 @@ def page_overview(s: Settings):
 
     summary_rows = []
     for i, sess in enumerate(st.session_state.sessions, start=1):
-        row = {
-            "#": i,
-            "結束時間": sess["ended_at"],
-            "事件數": sess["event_count"],
-            "本場東錢": sess.get("dong_total", 0),
-        }
+        row = {"#": i, "結束時間": sess["ended_at"], "事件數": sess["event_count"], "本場東錢": sess.get("dong_total", 0)}
         for r in sess["sum_df"]:
             row[r["玩家"]] = r["總分"]
         summary_rows.append(row)
 
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-
-    idx = st.number_input(
-        "查看第幾場封存牌局（1=最早）",
-        min_value=1,
-        max_value=len(st.session_state.sessions),
-        value=len(st.session_state.sessions),
-        step=1
-    )
-    sess = st.session_state.sessions[int(idx) - 1]
-
-    st.markdown("**該場：行為統計**")
-    st.dataframe(pd.DataFrame(sess["stats_df"]), hide_index=True, use_container_width=True)
-
-    st.markdown("**該場：最後 20 筆明細（尾巴）**")
-    st.dataframe(pd.DataFrame(sess["ledger_tail"]), hide_index=True, use_container_width=True)
 
 
 # ============================
@@ -808,7 +770,7 @@ def main():
 
     st.sidebar.title("選單")
     st.sidebar.caption(f"版本：{APP_VERSION}")
-    st.sidebar.caption("✅ 本機暫存：iPhone 重整後應可恢復（HTML Bridge）")
+    st.sidebar.caption("✅ 本機暫存：延遲載入（避免 Streamlit Cloud init 階段出錯）")
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
 
