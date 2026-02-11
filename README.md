@@ -1,0 +1,1 @@
+# tw-mahjong-score
