@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
-from streamlit_js_eval import streamlit_js_eval  # ✅ 用這個才可把 localStorage 回傳到 Python
+from streamlit_js_eval import streamlit_js_eval  # ✅ 需要 requirements.txt: streamlit-js-eval
 
 APP_VERSION = "v2026-02-11_02_full_debug_1"
 WINDS = ["東", "南", "西", "北"]
@@ -37,23 +37,19 @@ class Settings:
 
 
 # ============================
-# 2) LocalStorage Bridge (FIXED)
+# 2) LocalStorage Bridge (JS eval)
 # ============================
-def _ls_read(key: str) -> str:
+def _ls_read(key: str):
     """
-    ✅ 正確讀取 localStorage，並把值回傳給 Python
+    讀取 localStorage。注意：首次載入時可能回傳 None（JS 還沒回來），所以 init_state 會重試。
     """
-    v = streamlit_js_eval(
+    return streamlit_js_eval(
         js_expressions=f"window.localStorage.getItem({json.dumps(key)})",
-        key=f"LS_GET_{key}",
+        key=f"LS_GET_{key}_{st.session_state.get('ls_nonce', 0)}",
     )
-    return v or ""
 
 
 def _ls_write(key: str, value: str) -> None:
-    """
-    ✅ 正確寫入 localStorage
-    """
     js = f"window.localStorage.setItem({json.dumps(key)}, {json.dumps(value)});"
     streamlit_js_eval(
         js_expressions=js,
@@ -62,9 +58,6 @@ def _ls_write(key: str, value: str) -> None:
 
 
 def _ls_remove(key: str) -> None:
-    """
-    ✅ 正確刪除 localStorage
-    """
     js = f"window.localStorage.removeItem({json.dumps(key)});"
     streamlit_js_eval(
         js_expressions=js,
@@ -89,7 +82,6 @@ def restore_state(data: Dict[str, Any]) -> None:
         try:
             st.session_state.settings = Settings(**data["settings"])
         except Exception:
-            # schema mismatch fallback
             st.session_state.settings = Settings()
     st.session_state.events = data.get("events", []) or []
     st.session_state.sessions = data.get("sessions", []) or []
@@ -101,7 +93,6 @@ def autosave() -> None:
         payload = json.dumps(snapshot_state(), ensure_ascii=False)
         _ls_write(LOCAL_STORAGE_KEY, payload)
     except Exception:
-        # 不要讓存檔失敗影響主流程
         pass
 
 
@@ -131,12 +122,24 @@ def init_state():
     st.session_state.setdefault("reset_hand_inputs", False)
     st.session_state.setdefault("reset_pen_inputs", False)
 
-    # localStorage load-once
+    # localStorage load control
     st.session_state.setdefault("cloud_loaded", False)
     st.session_state.setdefault("ls_nonce", 0)
+    st.session_state.setdefault("ls_read_tries", 0)  # ✅ 讀取重試次數
 
+    # ✅ 重點修補：首次 rerun 可能拿到 None（JS 還沒回傳），所以重試 1~2 次
     if not st.session_state.cloud_loaded:
         raw = _ls_read(LOCAL_STORAGE_KEY)
+
+        if raw is None:
+            if st.session_state.ls_read_tries < 2:
+                st.session_state.ls_read_tries += 1
+                st.session_state.ls_nonce += 1
+                st.rerun()
+            else:
+                st.session_state.cloud_loaded = True
+            return
+
         if raw:
             try:
                 data = json.loads(raw)
@@ -144,6 +147,7 @@ def init_state():
                     restore_state(data)
             except Exception:
                 pass
+
         st.session_state.cloud_loaded = True
 
 
@@ -551,7 +555,8 @@ def page_record(s: Settings):
         st.session_state.selected_seat = None
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
-        st.session_state.cloud_loaded = True
+        st.session_state.cloud_loaded = False
+        st.session_state.ls_read_tries = 0
         st.rerun()
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
@@ -636,6 +641,8 @@ def page_record(s: Settings):
     if st.session_state.debug:
         st.write(f"DEBUG events len: {len(st.session_state.events)}")
         st.write("DEBUG sessions len:", len(st.session_state.sessions))
+        st.write("DEBUG cloud_loaded:", st.session_state.get("cloud_loaded"))
+        st.write("DEBUG ls_read_tries:", st.session_state.get("ls_read_tries"))
         if st.session_state.events:
             st.write("DEBUG last event:", ev_to_dict(st.session_state.events[-1]))
         st.write("DEBUG seating:", s.seat_players)
@@ -707,7 +714,7 @@ def main():
 
     st.sidebar.title("選單")
     st.sidebar.caption(f"版本：{APP_VERSION}")
-    st.sidebar.caption("✅ 本機暫存：iPhone 放背景/重整後可恢復")
+    st.sidebar.caption("✅ 本機暫存：iPhone 放背景/重整後可恢復（已加讀取重試）")
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
 
