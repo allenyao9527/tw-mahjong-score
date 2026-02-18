@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components  # ✅ for iPhone Safari localStorage gid restore
 
 # Supabase
 try:
@@ -60,23 +61,88 @@ def _get_supabase_client() -> Optional["Client"]:
         return None
 
 
+# --- ✅ GID persistence for iPhone Safari (1+2+3) ---
+def _persist_gid_to_local_storage(gid: str) -> None:
+    """Store gid in browser localStorage (works on iPhone Safari normal mode)."""
+    try:
+        safe_gid = str(gid).replace('"', "").replace("'", "")
+        components.html(
+            f"""
+            <script>
+            try {{
+              localStorage.setItem("tw_mj_last_gid", "{safe_gid}");
+            }} catch (e) {{}}
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+
+
+def _restore_gid_from_local_storage_if_missing() -> None:
+    """
+    If URL has no gid, restore from localStorage and redirect to ?gid=...
+    (iPhone Safari: survives app kill unless Private mode or site data cleared)
+    """
+    try:
+        components.html(
+            """
+            <script>
+            (function() {
+              try {
+                const params = new URLSearchParams(window.location.search);
+                const gid = params.get("gid");
+                if (!gid) {
+                  const last = localStorage.getItem("tw_mj_last_gid");
+                  if (last && last.length > 0) {
+                    params.set("gid", last);
+                    const newUrl = window.location.pathname + "?" + params.toString();
+                    window.location.replace(newUrl);
+                  }
+                }
+              } catch (e) {}
+            })();
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+
+
 def _get_or_init_game_id() -> str:
     """
-    Use URL query param gid as stable key across refresh.
-    If missing, generate one and write back to query params (so refresh keeps it).
+    Priority:
+    1) Use URL query param gid if present (and persist to localStorage)
+    2) If missing, try restore from localStorage by forcing a redirect (iPhone Safari)
+    3) If still missing, generate a new gid and write back to query params + localStorage
     """
+    # (2) If URL missing gid, try restore (may redirect and reload page)
+    try:
+        gid = st.query_params.get("gid", "")
+        if not gid:
+            _restore_gid_from_local_storage_if_missing()
+    except Exception:
+        pass
+
+    # (1) Read again (after potential restore)
     try:
         gid = st.query_params.get("gid", "")
         if gid:
-            return str(gid)
+            gid = str(gid)
+            _persist_gid_to_local_storage(gid)
+            return gid
     except Exception:
         gid = ""
 
+    # (3) Generate new
     gid = uuid.uuid4().hex
     try:
         st.query_params["gid"] = gid
     except Exception:
         pass
+    _persist_gid_to_local_storage(gid)
     return gid
 
 
@@ -293,8 +359,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             label = hand_label(rw, ds)
 
             result = ev.get("result", "")
-            w = safe_int(ev.get("winner_id", 0))
-            l = safe_int(ev.get("loser_id", 0))
+            # ✅ Self-draw/Draw can have None winner/loser; avoid coercing None to 0
+            w = safe_int(ev.get("winner_id"), default=-1)
+            l = safe_int(ev.get("loser_id"), default=-1)
             tai = safe_int(ev.get("tai", 0))
             A = amount_A(settings, tai)
 
@@ -695,11 +762,12 @@ def page_record(s: Settings):
             if res == "放槍" and int(win) == int(lose):
                 st.error("放槍時：贏家與放槍家不能相同")
             else:
+                # ✅ Self-draw fix: do not force loser_id=0 when not applicable
                 ev = {
                     "_type": "hand",
                     "result": res,
-                    "winner_id": int(win),
-                    "loser_id": int(lose),
+                    "winner_id": int(win) if res in ("自摸", "放槍") else None,
+                    "loser_id": int(lose) if res == "放槍" else None,
                     "tai": int(tai),
                 }
                 st.session_state.events.append(ev)
