@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components  # ✅ for iPhone Safari localStorage gid restore
+import streamlit.components.v1 as components  # ✅ for iPhone Safari localStorage + mobile detection
 
 # Supabase
 try:
@@ -16,10 +16,10 @@ except Exception:
     create_client = None
     Client = None  # type: ignore
 
-APP_VERSION = "v2026-02-12_supabase_cloud_save_1"
+APP_VERSION = "v2026-02-19_gid_mobile_recent_fix_1"
 WINDS = ["東", "南", "西", "北"]
 
-SUPABASE_TABLE = "game_states"  # 你已建立 public.game_states
+SUPABASE_TABLE = "game_states"  # public.game_states
 
 
 # ============================
@@ -232,6 +232,87 @@ def supabase_save(game_id: str) -> Tuple[bool, str]:
         return False, f"寫入 Supabase 失敗：{type(e).__name__}"
 
 
+# --- ✅ Recent games quick switch (Supabase last 10) ---
+def supabase_list_recent_game_ids(limit: int = 10, scan_rows: int = 200) -> List[Tuple[str, str]]:
+    """
+    Return recent distinct game_ids with latest created_at (client-side dedupe).
+    Returns list of (game_id, latest_created_at_iso).
+    """
+    sb = st.session_state.get("sb_client")
+    if sb is None:
+        return []
+    try:
+        res = (
+            sb.table(SUPABASE_TABLE)
+            .select("game_id, created_at")
+            .order("created_at", desc=True)
+            .limit(int(scan_rows))
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        seen = set()
+        out: List[Tuple[str, str]] = []
+        for r in rows:
+            gid = r.get("game_id")
+            ts = r.get("created_at")
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            out.append((str(gid), str(ts) if ts else ""))
+            if len(out) >= int(limit):
+                break
+        return out
+    except Exception:
+        return []
+
+
+def switch_to_game_id(gid: str) -> None:
+    """Switch current session to another gid by updating query params and forcing cloud reload."""
+    gid = str(gid)
+    try:
+        st.query_params["gid"] = gid
+    except Exception:
+        pass
+    st.session_state.game_id = gid
+    st.session_state.cloud_loaded = False
+    st.rerun()
+
+
+# --- ✅ Mobile layout auto flag (iPhone Safari) ---
+def _auto_set_mobile_flag() -> None:
+    """
+    Best-effort: if screen is narrow, set ?mobile=1 once via redirect.
+    (Keeps desktop layout unchanged.)
+    """
+    try:
+        components.html(
+            """
+            <script>
+            (function() {
+              try {
+                const isMobile = window.innerWidth <= 768;
+                const url = new URL(window.location.href);
+                if (isMobile && !url.searchParams.get("mobile")) {
+                  url.searchParams.set("mobile", "1");
+                  window.location.replace(url.toString());
+                }
+              } catch (e) {}
+            })();
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+
+
+def _is_mobile_layout() -> bool:
+    try:
+        return str(st.query_params.get("mobile", "")) == "1"
+    except Exception:
+        return False
+
+
 # ============================
 # 3) State / Helpers
 # ============================
@@ -359,7 +440,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             label = hand_label(rw, ds)
 
             result = ev.get("result", "")
-            # ✅ Self-draw/Draw can have None winner/loser; avoid coercing None to 0
+            # ✅ allow None winner/loser; avoid coercing None to player 0
             w = safe_int(ev.get("winner_id"), default=-1)
             l = safe_int(ev.get("loser_id"), default=-1)
             tai = safe_int(ev.get("tai", 0))
@@ -611,6 +692,15 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
             supabase_save(st.session_state.game_id)
             st.rerun()
 
+    # 📱 Mobile: vertical order 東南西北
+    if _is_mobile_layout():
+        seat_btn(0, st)  # 東
+        seat_btn(1, st)  # 南
+        seat_btn(2, st)  # 西
+        seat_btn(3, st)  # 北
+        return
+
+    # 🖥 Desktop: keep cross layout
     top = st.columns([1, 1.5, 1])
     seat_btn(1, top[1])  # 南
     mid = st.columns([1, 1.5, 1])
@@ -746,7 +836,13 @@ def page_record(s: Settings):
 
     if mode == "一般":
         res = st.selectbox("結果", ["自摸", "放槍", "流局"], key="hand_res")
-        tai = st.number_input("台數", min_value=0, step=1, key="hand_tai")
+
+        # ✅ BUG2: 流局不需要台數選項
+        tai = 0
+        if res in ("自摸", "放槍"):
+            tai = st.number_input("台數", min_value=0, step=1, key="hand_tai")
+        else:
+            st.session_state["hand_tai"] = 0  # clear stale value
 
         win = 0
         lose = 0
@@ -754,8 +850,12 @@ def page_record(s: Settings):
         if res in ("自摸", "放槍"):
             win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_win")
 
+        # ✅ BUG1: 放槍輸家下拉排除贏家
         if res == "放槍":
-            lose = st.selectbox("放槍家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_lose")
+            lose_options = [p for p in [0, 1, 2, 3] if p != int(win)]
+            if st.session_state.get("hand_lose") == int(win):
+                st.session_state["hand_lose"] = lose_options[0]
+            lose = st.selectbox("放槍家", lose_options, format_func=lambda x: s.players[x], key="hand_lose")
 
         submit = st.button("✅ 提交結果", use_container_width=True)
         if submit:
@@ -763,13 +863,15 @@ def page_record(s: Settings):
                 st.error("放槍時：贏家與放槍家不能相同")
             else:
                 # ✅ Self-draw fix: do not force loser_id=0 when not applicable
-                ev = {
+                ev: Dict[str, Any] = {
                     "_type": "hand",
                     "result": res,
                     "winner_id": int(win) if res in ("自摸", "放槍") else None,
                     "loser_id": int(lose) if res == "放槍" else None,
-                    "tai": int(tai),
                 }
+                if res in ("自摸", "放槍"):
+                    ev["tai"] = int(tai)  # 流局不寫台數
+
                 st.session_state.events.append(ev)
                 st.session_state["reset_hand_inputs"] = True
 
@@ -893,6 +995,7 @@ def page_overview(s: Settings):
 # ============================
 def main():
     st.set_page_config(layout="wide", page_title="麻將計分系統")
+    _auto_set_mobile_flag()  # ✅ mobile layout hint (safe best-effort)
     init_state()
 
     s: Settings = st.session_state.settings
@@ -905,6 +1008,32 @@ def main():
         st.sidebar.error("Supabase 未連線：請到 Streamlit Cloud → Settings → Secrets 設定 SUPABASE_URL / SUPABASE_KEY")
     else:
         st.sidebar.success("Supabase 已連線 ✅")
+
+    # ✅ Enhancement: Recent games quick switch
+    with st.sidebar.expander("🕘 近期牌局（最近10局）", expanded=False):
+        recent = supabase_list_recent_game_ids(limit=10, scan_rows=200)
+        if st.session_state.get("sb_client") is None:
+            st.caption("Supabase 未連線")
+        elif not recent:
+            st.caption("尚無資料或抓取失敗")
+        else:
+            options = [gid for gid, _ in recent]
+
+            def fmt(gid: str) -> str:
+                ts = next((t for g, t in recent if g == gid), "")
+                ts_short = ts[:19].replace("T", " ") if ts else ""
+                mark = "（目前）" if gid == st.session_state.game_id else ""
+                return f"{gid[:8]}  {ts_short} {mark}".strip()
+
+            pick = st.selectbox(
+                "切換到：",
+                options=options,
+                index=options.index(st.session_state.game_id) if st.session_state.game_id in options else 0,
+                format_func=fmt,
+                key="recent_gid_pick",
+            )
+            if st.button("切換", use_container_width=True):
+                switch_to_game_id(pick)
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
 
