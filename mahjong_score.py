@@ -42,6 +42,9 @@ class Settings:
     dong_per_self_draw: int = 0
     dong_cap_total: int = 0
 
+    # ✅ 莊家加台自動計算（預設開啟）
+    auto_dealer_bonus: bool = True
+
 
 # ============================
 # 2) Supabase Bridge
@@ -61,50 +64,58 @@ def _get_supabase_client() -> Optional["Client"]:
         return None
 
 
-# --- ✅ GID persistence for iPhone Safari (1+2+3) ---
-def _persist_gid_to_local_storage(gid: str) -> None:
-    """Store gid in browser localStorage."""
+def _is_mobile_layout() -> bool:
+    """Mobile layout toggle, persists using query param first, then iPhone Safari localStorage."""
     try:
-        safe_gid = str(gid).replace('"', "").replace("'", "")
+        v = st.query_params.get("mobile", "")
+        if v in ("1", "true", "True", "yes"):
+            return True
+        if v in ("0", "false", "False", "no"):
+            return False
+    except Exception:
+        pass
+
+    # Try Safari localStorage
+    try:
         components.html(
-            f"""
-            <script>
-            try {{
-              localStorage.setItem("tw_mj_last_gid", "{safe_gid}");
-            }} catch (e) {{}}
-            </script>
-            """,
+            """
+<script>
+(function(){
+  try{
+    const k="mj_mobile_layout";
+    const v=localStorage.getItem(k);
+    if(v===null){ return; }
+    const url=new URL(window.location.href);
+    // if query already set, do nothing
+    if(url.searchParams.get("mobile")!==null){ return; }
+    url.searchParams.set("mobile", v);
+    // Replace without triggering weird back/forward behavior
+    window.history.replaceState({}, "", url.toString());
+    window.location.reload();
+  }catch(e){}
+})();
+</script>
+""",
             height=0,
         )
     except Exception:
         pass
 
+    return False
 
-def _restore_gid_from_local_storage_if_missing() -> None:
-    """
-    If URL has no gid, restore from localStorage and redirect to ?gid=...
-    (works on iPhone Safari normal mode; private mode may not persist)
-    """
+
+def _set_mobile_layout(v: bool) -> None:
+    try:
+        st.query_params["mobile"] = "1" if v else "0"
+    except Exception:
+        pass
     try:
         components.html(
-            """
-            <script>
-            (function() {
-              try {
-                const params = new URLSearchParams(window.location.search);
-                const gid = params.get("gid");
-                if (!gid) {
-                  const last = localStorage.getItem("tw_mj_last_gid");
-                  if (last && last.length > 0) {
-                    params.set("gid", last);
-                    const newUrl = window.location.pathname + "?" + params.toString();
-                    window.location.replace(newUrl);
-                  }
-                }
-              } catch (e) {}
-            })();
-            </script>
-            """,
+            f"""
+<script>
+try{{ localStorage.setItem("mj_mobile_layout","{'1' if v else '0'}"); }}catch(e){{}}
+</script>
+""",
             height=0,
         )
     except Exception:
@@ -113,36 +124,21 @@ def _restore_gid_from_local_storage_if_missing() -> None:
 
 def _get_or_init_game_id() -> str:
     """
-    Priority:
-    1) Use URL query param gid if present (and persist to localStorage)
-    2) If missing, try restore from localStorage by forcing a redirect (iPhone Safari)
-    3) If still missing, generate a new gid and write back to query params + localStorage
+    Use URL query param gid as stable key across refresh.
+    If missing, generate one and write back to query params (so refresh keeps it).
     """
-    # (2) If URL missing gid, try restore (may redirect)
-    try:
-        gid = st.query_params.get("gid", "")
-        if not gid:
-            _restore_gid_from_local_storage_if_missing()
-    except Exception:
-        pass
-
-    # (1) Read again (after potential restore)
     try:
         gid = st.query_params.get("gid", "")
         if gid:
-            gid = str(gid)
-            _persist_gid_to_local_storage(gid)
-            return gid
+            return str(gid)
     except Exception:
         gid = ""
 
-    # (3) Generate new
     gid = uuid.uuid4().hex
     try:
         st.query_params["gid"] = gid
     except Exception:
         pass
-    _persist_gid_to_local_storage(gid)
     return gid
 
 
@@ -155,6 +151,7 @@ def snapshot_state() -> Dict[str, Any]:
         "settings": settings_dict,
         "events": st.session_state.get("events", []),
         "sessions": st.session_state.get("sessions", []),
+        "phase": st.session_state.get("phase", "seat_confirm"),
     }
 
 
@@ -168,10 +165,14 @@ def restore_state(data: Dict[str, Any]) -> None:
             st.session_state.settings = Settings()
     st.session_state.events = data.get("events", []) or []
     st.session_state.sessions = data.get("sessions", []) or []
+    st.session_state.phase = data.get("phase", "seat_confirm")
 
 
 def supabase_load_latest(game_id: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-    """Load latest state from Supabase for this game_id."""
+    """
+    Load latest state from Supabase for this game_id.
+    Returns (ok, msg, data_dict)
+    """
     sb = st.session_state.get("sb_client")
     if sb is None:
         return False, "Supabase 尚未連線（請在 Streamlit Cloud 設定 Secrets）", None
@@ -194,7 +195,7 @@ def supabase_load_latest(game_id: str) -> Tuple[bool, str, Optional[Dict[str, An
         if isinstance(state, str):
             data = json.loads(state)
         else:
-            data = state
+            data = state  # supabase may return dict
         if not isinstance(data, dict):
             return False, "雲端資料格式錯誤", None
         return True, "已從雲端載入最新狀態", data
@@ -204,90 +205,74 @@ def supabase_load_latest(game_id: str) -> Tuple[bool, str, Optional[Dict[str, An
 
 
 def supabase_save(game_id: str) -> Tuple[bool, str]:
-    """Save current snapshot into Supabase (insert a new row each time)."""
+    """
+    Save current snapshot into Supabase (insert a new row each time).
+    """
     sb = st.session_state.get("sb_client")
     if sb is None:
         return False, "Supabase 尚未連線（請在 Streamlit Cloud 設定 Secrets）"
 
     payload = snapshot_state()
     try:
-        _ = (
+        res = (
             sb.table(SUPABASE_TABLE)
-            .insert({"game_id": game_id, "state": payload})
+            .insert(
+                {
+                    "game_id": game_id,
+                    "state": payload,  # jsonb
+                }
+            )
             .execute()
         )
+        _ = getattr(res, "data", None)
         return True, "已存到雲端"
     except Exception as e:
         return False, f"寫入 Supabase 失敗：{type(e).__name__}"
 
 
-# --- ✅ Recent games quick switch (Supabase last 10) ---
-def supabase_list_recent_game_ids(limit: int = 10, scan_rows: int = 200) -> List[Tuple[str, str]]:
-    """Return recent distinct game_ids with latest created_at (client-side dedupe)."""
+def supabase_list_recent_games(limit: int = 10) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    """
+    Recent games = distinct game_id by latest created_at.
+    Returns list of rows: {game_id, created_at}
+    """
     sb = st.session_state.get("sb_client")
     if sb is None:
-        return []
+        return False, "Supabase 尚未連線", []
+
     try:
+        # Fetch recent rows and then pick distinct game_id by created_at desc
         res = (
             sb.table(SUPABASE_TABLE)
             .select("game_id, created_at")
             .order("created_at", desc=True)
-            .limit(int(scan_rows))
+            .limit(200)
             .execute()
         )
         rows = getattr(res, "data", None) or []
         seen = set()
-        out: List[Tuple[str, str]] = []
+        out = []
         for r in rows:
             gid = r.get("game_id")
-            ts = r.get("created_at")
             if not gid or gid in seen:
                 continue
             seen.add(gid)
-            out.append((str(gid), str(ts) if ts else ""))
-            if len(out) >= int(limit):
+            out.append({"game_id": gid, "created_at": r.get("created_at")})
+            if len(out) >= limit:
                 break
-        return out
-    except Exception:
-        return []
+        return True, "ok", out
+    except Exception as e:
+        return False, f"讀取最近列表失敗：{type(e).__name__}", []
 
 
-def switch_to_game_id(gid: str) -> None:
-    """Switch current session to another gid by updating query params and forcing cloud reload."""
-    gid = str(gid)
+def switch_game_id(gid: str) -> None:
+    """Switch to another existing game_id (keep same app state container)."""
     try:
         st.query_params["gid"] = gid
     except Exception:
         pass
     st.session_state.game_id = gid
     st.session_state.cloud_loaded = False
-    st.rerun()
-
-
-# --- ✅ Mobile layout (stable toggle; no Safari auto-redirect) ---
-def _is_mobile_layout() -> bool:
-    try:
-        return str(st.query_params.get("mobile", "")) == "1"
-    except Exception:
-        return False
-
-
-def set_mobile_layout(enabled: bool) -> None:
-    """
-    Toggle ?mobile=1 in URL for stable layout.
-    This is more reliable than JS auto-detect on iPhone Safari.
-    """
-    try:
-        if enabled:
-            st.query_params["mobile"] = "1"
-        else:
-            qp = dict(st.query_params)
-            qp.pop("mobile", None)
-            st.query_params.clear()
-            for k, v in qp.items():
-                st.query_params[k] = v
-    except Exception:
-        pass
+    st.session_state.phase = "seat_confirm"
     st.rerun()
 
 
@@ -296,11 +281,13 @@ def set_mobile_layout(enabled: bool) -> None:
 # ============================
 def init_state():
     st.session_state.setdefault("settings", Settings())
-    st.session_state.setdefault("events", [])       # 當前牌局
-    st.session_state.setdefault("sessions", [])     # 封存的牌局（同一個 game_id 下）
+    st.session_state.setdefault("events", [])       # 當前「本將」事件
+    st.session_state.setdefault("sessions", [])     # 今日多將（同一個 game_id 下）
 
     st.session_state.setdefault("selected_seat", None)
     st.session_state.setdefault("debug", True)
+    # match flow phase: seat_confirm -> playing
+    st.session_state.setdefault("phase", "seat_confirm")
 
     # UI state (reactive widgets keys)
     st.session_state.setdefault("hand_res", "自摸")
@@ -390,6 +377,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
     cum = [0] * n
     rows = []
 
+    # 狀態：圈風、莊位(座位idx)、連莊、東錢累積
     rw, ds, dr, d_acc = 0, 0, 0, 0
     debug_steps = []
 
@@ -412,13 +400,14 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
 
         dealer_pid = seat_players[ds]
         bonus = dealer_bonus_tai(dr)
+        eff_bonus = bonus if bool(getattr(settings, "auto_dealer_bonus", True)) else 0
 
         if ev.get("_type") == "hand":
             label = hand_label(rw, ds)
 
             result = ev.get("result", "")
-            w = safe_int(ev.get("winner_id"), default=-1)
-            l = safe_int(ev.get("loser_id"), default=-1)
+            w = safe_int(ev.get("winner_id", 0))
+            l = safe_int(ev.get("loser_id", 0))
             tai = safe_int(ev.get("tai", 0))
             A = amount_A(settings, tai)
 
@@ -442,9 +431,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                             delta[p] -= A
                     dr += 1
                 else:
-                    dealer_pay = amount_A(settings, tai + bonus)
+                    dealer_pay = amount_A(settings, tai + eff_bonus)
                     other_pay = A
-                    desc = f"{names[w]} 自摸({tai}台) [閒] (莊付{tai}+{bonus}台)"
+                    desc = f"{names[w]} 自摸({tai}台) [閒] (莊付{tai}+{eff_bonus}台)"
                     for p in range(n):
                         if p == w:
                             delta[p] += dealer_pay + 2 * other_pay
@@ -458,7 +447,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                 if settings.dong_per_self_draw > 0 and settings.dong_cap_total > 0:
                     remain = max(0, int(settings.dong_cap_total) - int(d_acc))
                     take = min(int(settings.dong_per_self_draw), remain)
-                    if take > 0 and 0 <= w < n:
+                    if take > 0:
                         delta[w] -= take
                         delta[int(settings.host_player_id)] += take
                         d_acc += take
@@ -479,8 +468,8 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                         dr += 1
                     else:
                         if l == dealer_pid:
-                            pay = amount_A(settings, tai + bonus)
-                            desc = f"{names[w]} 胡 {names[l]}({tai}台) [閒胡莊] (莊付{tai}+{bonus}台)"
+                            pay = amount_A(settings, tai + eff_bonus)
+                            desc = f"{names[w]} 胡 {names[l]}({tai}台) [閒胡莊] (莊付{tai}+{eff_bonus}台)"
                             delta[w] += pay
                             delta[l] -= pay
                         else:
@@ -496,6 +485,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             p_type = ev.get("p_type", "")
             amt = safe_int(ev.get("amount", 0))
 
+            # 罰則換莊規則：
+            # - 莊家有付錢（=莊家犯規）：換下一家
+            # - 非莊家付錢：莊留，dr += 1
             dealer_paid = False
 
             if p_type == "詐胡":
@@ -523,7 +515,8 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                     dealer_paid = True
                 else:
                     bonus_tai = dealer_bonus_tai(dr)
-                    dealer_extra = bonus_tai * int(settings.tai_value)
+                    bonus_tai_eff = bonus_tai if bool(getattr(settings, "auto_dealer_bonus", True)) else 0
+                    dealer_extra = bonus_tai_eff * int(settings.tai_value)
 
                     other_non_dealers = [p for p in range(n) if p not in (off, dealer_pid)]
                     for p in other_non_dealers:
@@ -536,7 +529,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
 
                     desc = (
                         f"{names[off]} 詐摸[閒]：賠兩閒各${amt}；"
-                        f"賠莊${amt}+{bonus_tai}台(每台{int(settings.tai_value)})=${pay_dealer}"
+                        f"賠莊${amt}+{bonus_tai_eff}台(每台{int(settings.tai_value)})=${pay_dealer}"
                     )
                     dealer_paid = False
             else:
@@ -560,7 +553,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
         rows.append(row)
 
         debug_steps.append(
-            f"[#{idx}] ds={ds} dealer={names[dealer_pid]} dr={dr} rw={rw} bonusTai={bonus} delta={delta} cum={cum}"
+            f"[#{idx}] ds={ds} dealer={names[dealer_pid]} dr={dr} rw={rw} bonusTai={bonus} effBonus={eff_bonus} delta={delta} cum={cum}"
         )
 
     ledger_df = pd.DataFrame(rows)
@@ -610,6 +603,7 @@ def page_settings(s: Settings):
 
         st.divider()
         draw_keep = st.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
+        auto_bonus = st.toggle("莊家加台自動計算（建議開啟）", value=bool(getattr(s, "auto_dealer_bonus", True)))
 
         st.divider()
         st.subheader("東（可選）")
@@ -623,6 +617,11 @@ def page_settings(s: Settings):
         dong_x = c3.number_input("自摸扣東（每次）", min_value=0, value=int(s.dong_per_self_draw), step=10)
         dong_cap = c4.number_input("東錢上限（累計）", min_value=0, value=int(s.dong_cap_total), step=50)
 
+        st.divider()
+        st.subheader("📱 手機版介面")
+        cur_mobile = _is_mobile_layout()
+        mobile = st.toggle("手機版：座位由上到下（東南西北）", value=bool(cur_mobile))
+
         save = st.form_submit_button("💾 儲存設定", use_container_width=True)
 
     if save:
@@ -630,11 +629,14 @@ def page_settings(s: Settings):
         s.base = int(base)
         s.tai_value = int(tai_value)
         s.draw_keeps_dealer = bool(draw_keep)
+        s.auto_dealer_bonus = bool(auto_bonus)
         s.host_player_id = int(host)
         s.dong_per_self_draw = int(dong_x)
         s.dong_cap_total = int(dong_cap)
 
         st.session_state.settings = s
+        _set_mobile_layout(bool(mobile))
+
         ok, msg = supabase_save(st.session_state.game_id)
         if ok:
             st.success("✅ 已儲存設定（雲端已保存）")
@@ -654,6 +656,10 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
         label = f"{prefix}{WINDS[seat_idx]}：{name}{mark} (${score})"
 
         if container.button(label, key=f"seatbtn_{seat_idx}", use_container_width=True):
+            if st.session_state.get("phase") == "playing":
+                st.warning("⚠️ 本將已開始，不能換座位。請先結束本將。")
+                return
+
             if st.session_state.selected_seat is None:
                 st.session_state.selected_seat = seat_idx
             else:
@@ -684,7 +690,7 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
 
 
 def end_current_session(s: Settings):
-    """把目前 events 封存到 sessions，然後清空 events 開新局。"""
+    """把目前 events 封存到 sessions，然後清空 events 準備下一將。"""
     events = st.session_state.events
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, events)
 
@@ -707,6 +713,7 @@ def end_current_session(s: Settings):
 
 
 def _new_game_confirmed():
+    # 新 game_id：變更 URL 參數，並清空 state
     new_gid = uuid.uuid4().hex
     try:
         st.query_params["gid"] = new_gid
@@ -720,7 +727,8 @@ def _new_game_confirmed():
     st.session_state.selected_seat = None
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
-    st.session_state.cloud_loaded = True
+    st.session_state.cloud_loaded = True  # 這次不要再讀舊局
+    st.session_state.phase = "seat_confirm"
     supabase_save(st.session_state.game_id)
     st.rerun()
 
@@ -777,31 +785,66 @@ def page_record(s: Settings):
 
     st.divider()
 
-    # 牌局封存（同 gid 下）
-    b1, b2, b3 = st.columns([1, 1, 1])
-    if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
+    # 📊 近期牌局快速切換（Supabase 最近10局）
+    if st.session_state.get("sb_client") is not None:
+        with st.expander("📊 近期牌局快速切換（Supabase 最近10局）", expanded=False):
+            ok, msg, items = supabase_list_recent_games(limit=10)
+            if not ok:
+                st.warning(msg)
+            elif not items:
+                st.caption("目前雲端沒有任何牌局紀錄。")
+            else:
+                cur_gid = st.session_state.game_id
+                for it in items:
+                    gid = it.get("game_id", "")
+                    created_at = it.get("created_at", "")
+                    label = f"{gid[:8]}...  {created_at}"
+                    cols = st.columns([4, 1])
+                    cols[0].write(label + ("  ✅(目前)" if gid == cur_gid else ""))
+                    if cols[1].button("切換", key=f"sw_{gid}", disabled=(gid == cur_gid)):
+                        switch_game_id(gid)
+
+    st.divider()
+
+    # 🧭 本將流程（同一個 gid 下可打多將；整天結束再看總覽）
+    st.session_state.setdefault("phase", "seat_confirm")
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+
+    # 1️⃣ 開始本將：鎖定座位，開始記錄事件
+    if c1.button("▶ 開始本將（鎖定座位）", use_container_width=True):
+        st.session_state.selected_seat = None
+        st.session_state.phase = "playing"
+        supabase_save(st.session_state.game_id)
+        st.rerun()
+
+    # 2️⃣ 結束本將：把本將 events 封存到 sessions，清空 events，回到座位確認
+    if c2.button("✅ 結束本將（存入今日紀錄）", use_container_width=True):
         if len(st.session_state.events) == 0:
-            st.warning("目前沒有事件，無需結束。")
+            st.warning("本將尚未有任何事件，無需結束。")
         else:
-            end_current_session(s)
-            st.success("已封存本局並開始新局（雲端已保存）。")
+            end_current_session(s)  # 會封存 + 清空 events
+            st.session_state.phase = "seat_confirm"
+            st.session_state.selected_seat = None
+            supabase_save(st.session_state.game_id)
+            st.success("本將已結束 ✅ 請調整下一將座位後按「開始本將」。")
             st.rerun()
 
-    if b2.button("🧹 清空本局（保留封存）", use_container_width=True):
-        st.session_state.events = []
-        st.session_state["reset_hand_inputs"] = True
-        st.session_state["reset_pen_inputs"] = True
-        supabase_save(st.session_state.game_id)
-        st.rerun()
+    # 3️⃣ 今日結束：不清空資料，只提示去總覽查看（可自行封存/匯出）
+    if c3.button("🏁 今日結束（不清空）", use_container_width=True):
+        st.success("今日活動結束 ✅ 你可以到「數據總覽」查看本日所有將（sessions）。")
 
-    if b3.button("🗑️ 清空全部（本局+封存）", use_container_width=True):
-        st.session_state.events = []
-        st.session_state.sessions = []
-        st.session_state.selected_seat = None
-        st.session_state["reset_hand_inputs"] = True
-        st.session_state["reset_pen_inputs"] = True
-        supabase_save(st.session_state.game_id)
-        st.rerun()
+    # Phase 提示 + gating
+    if st.session_state.phase == "seat_confirm":
+        st.info("🀄 新的一將開始：請先確認座位（誰坐東風位），再按「開始本將」。")
+        st.caption("提示：東風位一定是本將起莊；你可以把任意玩家換到東風位。")
+        st.stop()
+    else:
+        st.success("🎯 本將進行中：座位已鎖定（如要換位，請先「結束本將」）。")
+        if bool(getattr(s, "auto_dealer_bonus", True)):
+            st.caption("💡 台數輸入請填『牌型台』即可，莊家加台/連莊加台由系統自動計算（預設開啟）。")
+        else:
+            st.caption("💡 目前為手動模式：台數請自行包含莊家/連莊加台。")
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
 
@@ -881,6 +924,7 @@ def page_record(s: Settings):
             st.rerun()
     if c2.button("🧹 清空事件（只清本局事件）", use_container_width=True):
         st.session_state.events = []
+        st.session_state.phase = "seat_confirm"
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
         supabase_save(st.session_state.game_id)
@@ -898,6 +942,7 @@ def page_record(s: Settings):
     if st.session_state.debug:
         st.write("DEBUG cloud load msg:", st.session_state.get("cloud_load_msg", ""))
         st.write("DEBUG game_id:", st.session_state.game_id)
+        st.write("DEBUG phase:", st.session_state.get("phase"))
         st.write(f"DEBUG events len: {len(st.session_state.events)}")
         st.write("DEBUG sessions len:", len(st.session_state.sessions))
         if st.session_state.events:
@@ -914,9 +959,9 @@ def page_overview(s: Settings):
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, st.session_state.events)
     merged = pd.merge(sum_df, stats_df, on="玩家", how="left")
 
-    st.subheader("本局：總分 + 行為統計")
+    st.subheader("本將：總分 + 行為統計")
     st.dataframe(merged, hide_index=True, use_container_width=True)
-    st.info(f"本局目前：{WINDS[rw]}{ds+1}局 (連{dr}) ｜ 累計東錢：${int(d_acc)}")
+    st.info(f"本將目前：{WINDS[rw]}{ds+1}局 (連{dr}) ｜ 累計東錢：${int(d_acc)}")
 
     if not ledger_df.empty:
         chart_df = ledger_df.set_index("#")[s.players]
@@ -924,10 +969,10 @@ def page_overview(s: Settings):
         st.dataframe(ledger_df, hide_index=True, use_container_width=True)
 
     st.divider()
-    st.subheader("已結束的牌局（封存，仍在同一個 gid）")
+    st.subheader("今日已完成的將（sessions，同一個 gid）")
 
     if not st.session_state.sessions:
-        st.caption("尚無封存的牌局。你可以在「牌局錄入」按『結束牌局』。")
+        st.caption("尚無封存的將。你可以在「牌局錄入」按『結束本將』。")
         return
 
     summary_rows = []
@@ -945,7 +990,7 @@ def page_overview(s: Settings):
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
     idx = st.number_input(
-        "查看第幾場封存牌局（1=最早）",
+        "查看第幾將（1=最早）",
         min_value=1,
         max_value=len(st.session_state.sessions),
         value=len(st.session_state.sessions),
@@ -953,10 +998,10 @@ def page_overview(s: Settings):
     )
     sess = st.session_state.sessions[int(idx) - 1]
 
-    st.markdown("**該場：行為統計**")
+    st.markdown("**該將：行為統計**")
     st.dataframe(pd.DataFrame(sess["stats_df"]), hide_index=True, use_container_width=True)
 
-    st.markdown("**該場：最後 20 筆明細（尾巴）**")
+    st.markdown("**該將：最後 20 筆明細（尾巴）**")
     st.dataframe(pd.DataFrame(sess["ledger_tail"]), hide_index=True, use_container_width=True)
 
 
@@ -972,43 +1017,11 @@ def main():
     st.sidebar.title("選單")
     st.sidebar.caption(f"版本：{APP_VERSION}")
 
-    # ✅ stable mobile toggle (no Safari auto-redirect)
-    mobile_on = _is_mobile_layout()
-    new_mobile_on = st.sidebar.toggle("📱 手機直式座位（東南西北）", value=mobile_on)
-    if new_mobile_on != mobile_on:
-        set_mobile_layout(new_mobile_on)
-
     # Supabase status
     if st.session_state.get("sb_client") is None:
         st.sidebar.error("Supabase 未連線：請到 Streamlit Cloud → Settings → Secrets 設定 SUPABASE_URL / SUPABASE_KEY")
     else:
         st.sidebar.success("Supabase 已連線 ✅")
-
-    # ✅ Enhancement: Recent games quick switch
-    with st.sidebar.expander("🕘 近期牌局（最近10局）", expanded=False):
-        recent = supabase_list_recent_game_ids(limit=10, scan_rows=200)
-        if st.session_state.get("sb_client") is None:
-            st.caption("Supabase 未連線")
-        elif not recent:
-            st.caption("尚無資料或抓取失敗")
-        else:
-            options = [gid for gid, _ in recent]
-
-            def fmt(gid: str) -> str:
-                ts = next((t for g, t in recent if g == gid), "")
-                ts_short = ts[:19].replace("T", " ") if ts else ""
-                mark = "（目前）" if gid == st.session_state.game_id else ""
-                return f"{gid[:8]}  {ts_short} {mark}".strip()
-
-            pick = st.selectbox(
-                "切換到：",
-                options=options,
-                index=options.index(st.session_state.game_id) if st.session_state.game_id in options else 0,
-                format_func=fmt,
-                key="recent_gid_pick",
-            )
-            if st.button("切換", use_container_width=True):
-                switch_to_game_id(pick)
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
 
