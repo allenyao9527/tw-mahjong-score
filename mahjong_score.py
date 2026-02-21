@@ -16,7 +16,7 @@ except Exception:
     create_client = None
     Client = None  # type: ignore
 
-APP_VERSION = "v2026-02-22_quick_embed_v2_safe_2"
+APP_VERSION = "v2026-02-22_quick_embed_v2_safe_3"
 WINDS = ["東", "南", "西", "北"]
 
 SUPABASE_TABLE = "game_states"  # public.game_states
@@ -648,6 +648,7 @@ def page_settings(s: Settings):
 
         st.divider()
         draw_keep = st.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
+        auto_bonus = st.toggle("莊家加台自動計算", value=bool(getattr(s, "auto_dealer_bonus", True)))
 
         st.divider()
         st.subheader("東（可選）")
@@ -668,6 +669,7 @@ def page_settings(s: Settings):
         s.base = int(base)
         s.tai_value = int(tai_value)
         s.draw_keeps_dealer = bool(draw_keep)
+        s.auto_dealer_bonus = bool(auto_bonus)
         s.host_player_id = int(host)
         s.dong_per_self_draw = int(dong_x)
         s.dong_cap_total = int(dong_cap)
