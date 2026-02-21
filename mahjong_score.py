@@ -308,6 +308,7 @@ def init_state():
     # Quick input / seat lock (mobile friendly)
     st.session_state.setdefault("seat_locked", False)  # 鎖座位後：點人名=快速記錄，不再換位
     st.session_state.setdefault("quick_actor_seat", None)  # 0..3
+    st.session_state.setdefault("quick_action", None)  # '自摸'/'放槍'/'流局'/'詐胡'/'詐摸'
 
     # UI state (reactive widgets keys)
     st.session_state.setdefault("hand_res", "自摸")
@@ -441,12 +442,13 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                     stats[w]["自摸"] += 1
 
                 if w == dealer_pid:
-                    desc = f"{names[w]} 自摸({tai}台) [莊]"
+                    win_A = amount_A(settings, tai + bonus)  # ✅ 莊家自摸也吃莊連加台（toggle off 時 bonus=0）
+                    desc = f"{names[w]} 自摸({tai}台) [莊]" if bonus == 0 else f"{names[w]} 自摸({tai}台) [莊] (含莊連+{bonus}台)"
                     for p in range(n):
                         if p == w:
-                            delta[p] += 3 * A
+                            delta[p] += 3 * win_A
                         else:
-                            delta[p] -= A
+                            delta[p] -= win_A
                     dr += 1
                 else:
                     dealer_pay = amount_A(settings, tai + bonus)
@@ -470,10 +472,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                         delta[int(settings.host_player_id)] += take
                         d_acc += take
 
-            elif result in ("胡牌", "放槍"):
-                # 支援舊資料 "放槍" 也視為胡牌事件
+            elif result in ("放槍", "胡牌"):
                 if w == l:
-                    desc = "錯誤：胡牌者=被胡者"
+                    desc = "錯誤：胡牌者=放槍者"
                 else:
                     if 0 <= w < n:
                         stats[w]["胡"] += 1
@@ -481,9 +482,10 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                         stats[l]["放槍"] += 1
 
                     if w == dealer_pid:
-                        desc = f"{names[w]} 胡 {names[l]}({tai}台) [莊]"
-                        delta[w] += A
-                        delta[l] -= A
+                        win_A = amount_A(settings, tai + bonus)  # ✅ 莊家胡牌也吃莊連加台（toggle off 時 bonus=0）
+                        desc = f"{names[w]} 胡 {names[l]}({tai}台) [莊]" if bonus == 0 else f"{names[w]} 胡 {names[l]}({tai}台) [莊] (含莊連+{bonus}台)"
+                        delta[w] += win_A
+                        delta[l] -= win_A
                         dr += 1
                     else:
                         if l == dealer_pid:
@@ -645,11 +647,7 @@ def page_settings(s: Settings):
         tai_value = c2.number_input("每台金額", min_value=0, value=int(s.tai_value), step=10)
 
         st.divider()
-        c3, c4 = st.columns(2)
-        draw_keep = c3.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
-        auto_bonus = c4.toggle("莊家加台自動計算", value=bool(getattr(s, "auto_dealer_bonus", True)))
-
-        st.caption("※ 開啟後：台數只填牌型台；若胡到莊家/莊家連莊加台會自動加上。")
+        draw_keep = st.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
 
         st.divider()
         st.subheader("東（可選）")
@@ -659,9 +657,9 @@ def page_settings(s: Settings):
             index=int(s.host_player_id),
             format_func=lambda pid: new_players[pid],
         )
-        c5, c6 = st.columns(2)
-        dong_x = c5.number_input("自摸扣東（每次）", min_value=0, value=int(s.dong_per_self_draw), step=10)
-        dong_cap = c6.number_input("東錢上限（累計）", min_value=0, value=int(s.dong_cap_total), step=50)
+        c3, c4 = st.columns(2)
+        dong_x = c3.number_input("自摸扣東（每次）", min_value=0, value=int(s.dong_per_self_draw), step=10)
+        dong_cap = c4.number_input("東錢上限（累計）", min_value=0, value=int(s.dong_cap_total), step=50)
 
         save = st.form_submit_button("💾 儲存設定", use_container_width=True)
 
@@ -670,7 +668,6 @@ def page_settings(s: Settings):
         s.base = int(base)
         s.tai_value = int(tai_value)
         s.draw_keeps_dealer = bool(draw_keep)
-        s.auto_dealer_bonus = bool(auto_bonus)
         s.host_player_id = int(host)
         s.dong_per_self_draw = int(dong_x)
         s.dong_cap_total = int(dong_cap)
@@ -698,6 +695,7 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, day_tot
             # seat_locked=True：點人名做快速記錄（不交換座位）
             if st.session_state.get("seat_locked", False):
                 st.session_state.quick_actor_seat = seat_idx
+                st.session_state.quick_action = None
                 st.rerun()
             # seat_locked=False：維持原本的換位操作（點兩次交換）
             else:
@@ -715,7 +713,7 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, day_tot
         # ✅ 座位下方嵌入快速記錄面板（鎖座位時）
         if st.session_state.get("seat_locked", False) and st.session_state.get("quick_actor_seat", None) == seat_idx:
             container.markdown("#### ⚡ 快速記錄")
-
+            # 事件類型
             action = container.radio(
                 "類型",
                 ["自摸", "胡牌", "流局", "罰則：詐胡", "罰則：詐摸"],
@@ -723,6 +721,7 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, day_tot
                 key=f"q_action_{seat_idx}",
             )
 
+            # 依事件顯示必要欄位
             if action in ("自摸", "胡牌"):
                 tai = container.number_input("台數", min_value=0, step=1, key=f"q_tai_{seat_idx}")
             else:
@@ -730,23 +729,13 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, day_tot
 
             if action == "胡牌":
                 lose_options = [p for p in [0, 1, 2, 3] if p != int(pid)]
-                loser = container.selectbox(
-                    "被胡者",
-                    lose_options,
-                    format_func=lambda x: s.players[x],
-                    key=f"q_loser_{seat_idx}",
-                )
+                loser = container.selectbox("被胡者", lose_options, format_func=lambda x: s.players[x], key=f"q_loser_{seat_idx}")
             else:
                 loser = None
 
             if action == "罰則：詐胡":
                 vic_options = [p for p in [0, 1, 2, 3] if p != int(pid)]
-                victim = container.selectbox(
-                    "賠付對象",
-                    vic_options,
-                    format_func=lambda x: s.players[x],
-                    key=f"q_victim_{seat_idx}",
-                )
+                victim = container.selectbox("賠付對象", vic_options, format_func=lambda x: s.players[x], key=f"q_victim_{seat_idx}")
                 amt = container.number_input("金額", min_value=0, step=50, key=f"q_amt_zah_{seat_idx}")
             elif action == "罰則：詐摸":
                 victim = None
@@ -772,11 +761,13 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, day_tot
                 st.session_state["reset_hand_inputs"] = True
                 st.session_state["reset_pen_inputs"] = True
                 st.session_state.quick_actor_seat = None
+                st.session_state.quick_action = None
                 supabase_save(st.session_state.game_id)
                 st.rerun()
 
             if q2.button("取消", use_container_width=True, key=f"q_cancel_{seat_idx}"):
                 st.session_state.quick_actor_seat = None
+                st.session_state.quick_action = None
                 st.rerun()
 
     # 📱 Mobile: vertical order 東南西北
@@ -853,6 +844,7 @@ def page_record(s: Settings):
     day_totals = compute_day_totals(s, sum_df)
     render_seat_map(s, sum_df, dealer_seat=ds, day_totals=day_totals)
 
+
     # 📱 快速輸入：先鎖座位（鎖定後點人名=快速記錄）
     lc1, lc2 = st.columns(2)
     if not st.session_state.get("seat_locked", False):
@@ -860,6 +852,7 @@ def page_record(s: Settings):
             st.session_state.seat_locked = True
             st.session_state.selected_seat = None
             st.session_state.quick_actor_seat = None
+            st.session_state.quick_action = None
             supabase_save(st.session_state.game_id)
             st.rerun()
         lc2.caption("鎖定後：點人名可快速記錄，不必往下滑")
@@ -867,6 +860,7 @@ def page_record(s: Settings):
         if lc1.button("🔓 解鎖座位（可換位）", use_container_width=True):
             st.session_state.seat_locked = False
             st.session_state.quick_actor_seat = None
+            st.session_state.quick_action = None
             supabase_save(st.session_state.game_id)
             st.rerun()
         lc2.caption("解鎖後：點兩個座位可交換")
@@ -889,30 +883,26 @@ def page_record(s: Settings):
         if res in ("自摸", "胡牌"):
             win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_win")
 
-        # ✅ 被胡者下拉排除贏家
+        # ✅ 放槍輸家下拉排除贏家
         if res == "胡牌":
             lose_options = [p for p in [0, 1, 2, 3] if p != int(win)]
             if st.session_state.get("hand_lose") == int(win):
                 st.session_state["hand_lose"] = lose_options[0]
-            lose = st.selectbox("被胡者", lose_options, format_func=lambda x: s.players[x], key="hand_lose")
+            lose = st.selectbox("放槍家", lose_options, format_func=lambda x: s.players[x], key="hand_lose")
 
         submit = st.button("✅ 提交結果", use_container_width=True)
         if submit:
             if res == "胡牌" and int(win) == int(lose):
                 st.error("胡牌時：胡牌者與被胡者不能相同")
             else:
-                # ✅ 這裡原本你那版把 res 判斷寫成 ("自摸","放槍") 會導致 winner/loser 存錯
-                ev: Dict[str, Any] = {"_type": "hand", "result": res, "tai": int(tai) if res in ("自摸", "胡牌") else 0}
-
-                if res == "自摸":
-                    ev["winner_id"] = int(win)
-                    ev["loser_id"] = None
-                elif res == "胡牌":
-                    ev["winner_id"] = int(win)
-                    ev["loser_id"] = int(lose)
-                else:  # 流局
-                    ev["winner_id"] = None
-                    ev["loser_id"] = None
+                ev: Dict[str, Any] = {
+                    "_type": "hand",
+                    "result": res,
+                    "winner_id": int(win) if res in ("自摸", "放槍") else None,
+                    "loser_id": int(lose) if res == "放槍" else None,
+                }
+                if res in ("自摸", "胡牌"):
+                    ev["tai"] = int(tai)
 
                 st.session_state.events.append(ev)
                 st.session_state["reset_hand_inputs"] = True
@@ -955,6 +945,7 @@ def page_record(s: Settings):
         st.session_state.events = []
         st.session_state.seat_locked = False
         st.session_state.quick_actor_seat = None
+        st.session_state.quick_action = None
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
         supabase_save(st.session_state.game_id)
