@@ -1141,6 +1141,20 @@ def page_overview(s: Settings):
         st.line_chart(chart_df)
         st.dataframe(ledger_df, hide_index=True, use_container_width=True)
 
+    overview_df = ledger_df
+    with st.expander("DEBUG Overview", expanded=False):
+        if overview_df.empty:
+            st.write("overview_df is empty")
+        else:
+            distinct_hand_index = sorted(overview_df["類型"].unique()) if "類型" in overview_df.columns else []
+            max_hand_index = overview_df["#"].max() if "#" in overview_df.columns else None
+            st.write("distinct_hand_index (sorted unique):", distinct_hand_index)
+            st.write("max_hand_index:", max_hand_index)
+            st.write("len(distinct_hand_index):", len(distinct_hand_index))
+            st.write("overview_df.shape:", overview_df.shape)
+            st.write("overview_df.tail(5):")
+            st.dataframe(overview_df.tail(5), hide_index=True)
+
     st.divider()
     st.subheader("已結束的牌局（封存，仍在同一個 gid）")
 
