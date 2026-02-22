@@ -16,7 +16,7 @@ except Exception:
     create_client = None
     Client = None  # type: ignore
 
-APP_VERSION = "v2026-02-22_quick_embed_v2_safe_3"
+APP_VERSION = "v2026-02-22_quick_embed_v2_safe_4"
 WINDS = ["東", "南", "西", "北"]
 
 SUPABASE_TABLE = "game_states"  # public.game_states
@@ -36,9 +36,6 @@ class Settings:
     seat_players: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
 
     draw_keeps_dealer: bool = True
-
-    # ✅ 莊家加台自動計算（台數只填牌型台）
-    auto_dealer_bonus: bool = True
 
     # 東錢（可選）
     host_player_id: int = 0
@@ -305,11 +302,6 @@ def init_state():
     st.session_state.setdefault("selected_seat", None)
     st.session_state.setdefault("debug", True)
 
-    # Quick input / seat lock (mobile friendly)
-    st.session_state.setdefault("seat_locked", False)  # 鎖座位後：點人名=快速記錄，不再換位
-    st.session_state.setdefault("quick_actor_seat", None)  # 0..3
-    st.session_state.setdefault("quick_action", None)  # '自摸'/'放槍'/'流局'/'詐胡'/'詐摸'
-
     # UI state (reactive widgets keys)
     st.session_state.setdefault("hand_res", "自摸")
     st.session_state.setdefault("hand_tai", 0)
@@ -419,7 +411,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
         desc = ""
 
         dealer_pid = seat_players[ds]
-        bonus = dealer_bonus_tai(dr) if getattr(settings, "auto_dealer_bonus", True) else 0
+        bonus = dealer_bonus_tai(dr)
 
         if ev.get("_type") == "hand":
             label = hand_label(rw, ds)
@@ -442,13 +434,12 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                     stats[w]["自摸"] += 1
 
                 if w == dealer_pid:
-                    win_A = amount_A(settings, tai + bonus)  # ✅ 莊家自摸也吃莊連加台（toggle off 時 bonus=0）
-                    desc = f"{names[w]} 自摸({tai}台) [莊]" if bonus == 0 else f"{names[w]} 自摸({tai}台) [莊] (含莊連+{bonus}台)"
+                    desc = f"{names[w]} 自摸({tai}台) [莊]"
                     for p in range(n):
                         if p == w:
-                            delta[p] += 3 * win_A
+                            delta[p] += 3 * A
                         else:
-                            delta[p] -= win_A
+                            delta[p] -= A
                     dr += 1
                 else:
                     dealer_pay = amount_A(settings, tai + bonus)
@@ -482,10 +473,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                         stats[l]["放槍"] += 1
 
                     if w == dealer_pid:
-                        win_A = amount_A(settings, tai + bonus)  # ✅ 莊家胡牌也吃莊連加台（toggle off 時 bonus=0）
-                        desc = f"{names[w]} 胡 {names[l]}({tai}台) [莊]" if bonus == 0 else f"{names[w]} 胡 {names[l]}({tai}台) [莊] (含莊連+{bonus}台)"
-                        delta[w] += win_A
-                        delta[l] -= win_A
+                        desc = f"{names[w]} 胡 {names[l]}({tai}台) [莊]"
+                        delta[w] += A
+                        delta[l] -= A
                         dr += 1
                     else:
                         if l == dealer_pid:
@@ -586,34 +576,6 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
     return ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps
 
 
-def compute_day_totals(settings: Settings, current_sum_df: pd.DataFrame) -> Dict[str, int]:
-    """
-    今日累計 = sum(已結束 sessions 的 sum_df) + (目前本將 current_sum_df)
-    以玩家名稱為 key（假設同一日不會中途改名；若會改名，可再升級成用 player_id）。
-    """
-    totals: Dict[str, int] = {settings.players[i]: 0 for i in range(4)}
-
-    # 已完成的將
-    for sess in st.session_state.get("sessions", []):
-        for r in sess.get("sum_df", []) or []:
-            name = r.get("玩家")
-            if not name:
-                continue
-            val = safe_int(r.get("總分", 0))
-            totals[name] = totals.get(name, 0) + val
-
-    # 本將進行中
-    if current_sum_df is not None and not current_sum_df.empty:
-        for r in current_sum_df.to_dict(orient="records"):
-            name = r.get("玩家")
-            if not name:
-                continue
-            val = safe_int(r.get("總分", 0))
-            totals[name] = totals.get(name, 0) + val
-
-    return totals
-
-
 def _apply_reset_flags_before_widgets():
     if st.session_state.get("reset_hand_inputs"):
         st.session_state["hand_res"] = "自摸"
@@ -647,8 +609,9 @@ def page_settings(s: Settings):
         tai_value = c2.number_input("每台金額", min_value=0, value=int(s.tai_value), step=10)
 
         st.divider()
-        draw_keep = st.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
-        auto_bonus = st.toggle("莊家加台自動計算", value=bool(getattr(s, "auto_dealer_bonus", True)))
+        cT1, cT2 = st.columns(2)
+        draw_keep = cT1.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
+        auto_bonus = cT2.toggle("莊家加台自動計算", value=bool(getattr(s, "auto_dealer_bonus", True)), help="開啟後：台數只填牌型台；遇到莊家/連莊相關情境會自動加上莊連台。")
 
         st.divider()
         st.subheader("東（可選）")
@@ -683,94 +646,27 @@ def page_settings(s: Settings):
         st.rerun()
 
 
-def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, day_totals: Dict[str, int]):
+def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
     def seat_btn(seat_idx: int, container):
         pid = s.seat_players[seat_idx]
         name = s.players[pid]
-        score = int(day_totals.get(name, 0))
+        score = int(sum_df.loc[sum_df["玩家"] == name, "總分"].values[0]) if not sum_df.empty else 0
         is_dealer = (seat_idx == dealer_seat)
         mark = " 🀄" if is_dealer else ""
         prefix = "👉 " if st.session_state.selected_seat == seat_idx else ""
         label = f"{prefix}{WINDS[seat_idx]}：{name}{mark} (${score})"
 
         if container.button(label, key=f"seatbtn_{seat_idx}", use_container_width=True):
-            # seat_locked=True：點人名做快速記錄（不交換座位）
-            if st.session_state.get("seat_locked", False):
-                st.session_state.quick_actor_seat = seat_idx
-                st.session_state.quick_action = None
-                st.rerun()
-            # seat_locked=False：維持原本的換位操作（點兩次交換）
+            if st.session_state.selected_seat is None:
+                st.session_state.selected_seat = seat_idx
             else:
-                if st.session_state.selected_seat is None:
-                    st.session_state.selected_seat = seat_idx
-                else:
-                    o = st.session_state.selected_seat
-                    s.seat_players[o], s.seat_players[seat_idx] = s.seat_players[seat_idx], s.seat_players[o]
-                    st.session_state.selected_seat = None
+                o = st.session_state.selected_seat
+                s.seat_players[o], s.seat_players[seat_idx] = s.seat_players[seat_idx], s.seat_players[o]
+                st.session_state.selected_seat = None
 
-                st.session_state.settings = s
-                supabase_save(st.session_state.game_id)
-                st.rerun()
-
-        # ✅ 座位下方嵌入快速記錄面板（鎖座位時）
-        if st.session_state.get("seat_locked", False) and st.session_state.get("quick_actor_seat", None) == seat_idx:
-            container.markdown("#### ⚡ 快速記錄")
-            # 事件類型
-            action = container.radio(
-                "類型",
-                ["自摸", "胡牌", "流局", "罰則：詐胡", "罰則：詐摸"],
-                horizontal=True,
-                key=f"q_action_{seat_idx}",
-            )
-
-            # 依事件顯示必要欄位
-            if action in ("自摸", "胡牌"):
-                tai = container.number_input("台數", min_value=0, step=1, key=f"q_tai_{seat_idx}")
-            else:
-                tai = 0
-
-            if action == "胡牌":
-                lose_options = [p for p in [0, 1, 2, 3] if p != int(pid)]
-                loser = container.selectbox("被胡者", lose_options, format_func=lambda x: s.players[x], key=f"q_loser_{seat_idx}")
-            else:
-                loser = None
-
-            if action == "罰則：詐胡":
-                vic_options = [p for p in [0, 1, 2, 3] if p != int(pid)]
-                victim = container.selectbox("賠付對象", vic_options, format_func=lambda x: s.players[x], key=f"q_victim_{seat_idx}")
-                amt = container.number_input("金額", min_value=0, step=50, key=f"q_amt_zah_{seat_idx}")
-            elif action == "罰則：詐摸":
-                victim = None
-                amt = container.number_input("金額", min_value=0, step=50, key=f"q_amt_zam_{seat_idx}")
-            else:
-                victim = None
-                amt = 0
-
-            q1, q2 = container.columns(2)
-            if q1.button("✅ 送出", use_container_width=True, key=f"q_submit_{seat_idx}"):
-                if action == "流局":
-                    ev = {"_type": "hand", "result": "流局", "winner_id": None, "loser_id": None, "tai": 0}
-                elif action == "自摸":
-                    ev = {"_type": "hand", "result": "自摸", "winner_id": int(pid), "loser_id": None, "tai": int(tai)}
-                elif action == "胡牌":
-                    ev = {"_type": "hand", "result": "胡牌", "winner_id": int(pid), "loser_id": int(loser), "tai": int(tai)}
-                elif action == "罰則：詐胡":
-                    ev = {"_type": "penalty", "p_type": "詐胡", "offender_id": int(pid), "victim_id": int(victim), "amount": int(amt)}
-                else:  # 罰則：詐摸
-                    ev = {"_type": "penalty", "p_type": "詐摸", "offender_id": int(pid), "victim_id": 0, "amount": int(amt)}
-
-                st.session_state.events.append(ev)
-                st.session_state["reset_hand_inputs"] = True
-                st.session_state["reset_pen_inputs"] = True
-                st.session_state.quick_actor_seat = None
-                st.session_state.quick_action = None
-                supabase_save(st.session_state.game_id)
-                st.rerun()
-
-            if q2.button("取消", use_container_width=True, key=f"q_cancel_{seat_idx}"):
-                st.session_state.quick_actor_seat = None
-                st.session_state.quick_action = None
-                st.rerun()
+            st.session_state.settings = s
+            supabase_save(st.session_state.game_id)
+            st.rerun()
 
     # 📱 Mobile: vertical order 東南西北
     if _is_mobile_layout():
@@ -843,38 +739,81 @@ def page_record(s: Settings):
     st.caption("莊家依局數固定：東→南→西→北（只能調整玩家座位，不可手動改莊位）。")
 
     st.divider()
-    day_totals = compute_day_totals(s, sum_df)
-    render_seat_map(s, sum_df, dealer_seat=ds, day_totals=day_totals)
+    render_seat_map(s, sum_df, dealer_seat=ds)
 
+    st.divider()
 
-    # 📱 快速輸入：先鎖座位（鎖定後點人名=快速記錄）
-    lc1, lc2 = st.columns(2)
-    if not st.session_state.get("seat_locked", False):
-        if lc1.button("🔒 開始記錄（鎖定座位）", use_container_width=True):
-            st.session_state.seat_locked = True
-            st.session_state.selected_seat = None
-            st.session_state.quick_actor_seat = None
-            st.session_state.quick_action = None
-            supabase_save(st.session_state.game_id)
+    # 雲端/局管理
+    cA, cB, cC = st.columns([1, 1, 1])
+    if cA.button("💾 立即存檔到雲端", use_container_width=True):
+        ok, msg = supabase_save(st.session_state.game_id)
+        if ok:
+            st.success("已存到雲端 ✅")
+        else:
+            st.error(msg)
+
+    if cB.button("🔄 從雲端重新載入", use_container_width=True):
+        ok, msg, data = supabase_load_latest(st.session_state.game_id)
+        if ok and data:
+            restore_state(data)
+            st.success("已從雲端載入 ✅")
             st.rerun()
-        lc2.caption("鎖定後：點人名可快速記錄，不必往下滑")
-    else:
-        if lc1.button("🔓 解鎖座位（可換位）", use_container_width=True):
-            st.session_state.seat_locked = False
-            st.session_state.quick_actor_seat = None
-            st.session_state.quick_action = None
-            supabase_save(st.session_state.game_id)
+        elif ok:
+            st.warning("雲端沒有資料（新局）")
+        else:
+            st.error(msg)
+
+    with cC:
+        if st.button("🆕 開新局（換 gid）", use_container_width=True):
+            st.session_state["confirm_new_game"] = True
+
+    if st.session_state.get("confirm_new_game"):
+        st.warning("你確定要開新局嗎？（會清空目前畫面資料，但雲端歷史仍在舊 gid）")
+        x1, x2 = st.columns(2)
+        if x1.button("✅ 確定開新局", use_container_width=True):
+            st.session_state["confirm_new_game"] = False
+            _new_game_confirmed()
+        if x2.button("取消", use_container_width=True):
+            st.session_state["confirm_new_game"] = False
+
+    st.info(f"🆔 本局 game_id：`{st.session_state.game_id}`（URL 會帶 gid，重整不會變）")
+
+    st.divider()
+
+    # 牌局封存（同 gid 下）
+    b1, b2, b3 = st.columns([1, 1, 1])
+    if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
+        if len(st.session_state.events) == 0:
+            st.warning("目前沒有事件，無需結束。")
+        else:
+            end_current_session(s)
+            st.success("已封存本局並開始新局（雲端已保存）。")
             st.rerun()
-        lc2.caption("解鎖後：點兩個座位可交換")
+
+    if b2.button("🧹 清空本局（保留封存）", use_container_width=True):
+        st.session_state.events = []
+        st.session_state["reset_hand_inputs"] = True
+        st.session_state["reset_pen_inputs"] = True
+        supabase_save(st.session_state.game_id)
+        st.rerun()
+
+    if b3.button("🗑️ 清空全部（本局+封存）", use_container_width=True):
+        st.session_state.events = []
+        st.session_state.sessions = []
+        st.session_state.selected_seat = None
+        st.session_state["reset_hand_inputs"] = True
+        st.session_state["reset_pen_inputs"] = True
+        supabase_save(st.session_state.game_id)
+        st.rerun()
 
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
 
     if mode == "一般":
-        res = st.selectbox("結果", ["自摸", "胡牌", "流局"], key="hand_res")
+        res = st.selectbox("結果", ["自摸", "放槍", "流局"], key="hand_res")
 
         # ✅ 流局不需要台數
         tai = 0
-        if res in ("自摸", "胡牌"):
+        if res in ("自摸", "放槍"):
             tai = st.number_input("台數", min_value=0, step=1, key="hand_tai")
         else:
             st.session_state["hand_tai"] = 0
@@ -882,11 +821,11 @@ def page_record(s: Settings):
         win = 0
         lose = 0
 
-        if res in ("自摸", "胡牌"):
+        if res in ("自摸", "放槍"):
             win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_win")
 
         # ✅ 放槍輸家下拉排除贏家
-        if res == "胡牌":
+        if res == "放槍":
             lose_options = [p for p in [0, 1, 2, 3] if p != int(win)]
             if st.session_state.get("hand_lose") == int(win):
                 st.session_state["hand_lose"] = lose_options[0]
@@ -894,16 +833,16 @@ def page_record(s: Settings):
 
         submit = st.button("✅ 提交結果", use_container_width=True)
         if submit:
-            if res == "胡牌" and int(win) == int(lose):
-                st.error("胡牌時：胡牌者與被胡者不能相同")
+            if res == "放槍" and int(win) == int(lose):
+                st.error("放槍時：贏家與放槍家不能相同")
             else:
                 ev: Dict[str, Any] = {
                     "_type": "hand",
                     "result": res,
-                    "winner_id": int(win) if res in ("自摸", "放槍") else None,
-                    "loser_id": int(lose) if res == "放槍" else None,
+                    "winner_id": int(win) if res in ("自摸", "胡牌") else None,
+                    "loser_id": int(lose) if res == "胡牌" else None,
                 }
-                if res in ("自摸", "胡牌"):
+                if res in ("自摸", "放槍"):
                     ev["tai"] = int(tai)
 
                 st.session_state.events.append(ev)
@@ -945,9 +884,6 @@ def page_record(s: Settings):
             st.rerun()
     if c2.button("🧹 清空事件（只清本局事件）", use_container_width=True):
         st.session_state.events = []
-        st.session_state.seat_locked = False
-        st.session_state.quick_actor_seat = None
-        st.session_state.quick_action = None
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
         supabase_save(st.session_state.game_id)
@@ -973,6 +909,75 @@ def page_record(s: Settings):
         st.write("DEBUG players:", s.players)
         st.write("DEBUG steps (last 30):")
         st.code("\n".join(debug_steps[-30:]))
+
+    st.divider()
+    with st.expander("☁️ 雲端存檔 / 開新局 / 封存（放在頁面底部）", expanded=False):
+        cA, cB, cC = st.columns([1, 1, 1])
+
+        if cA.button("💾 立即存檔到雲端", use_container_width=True):
+            ok, msg = supabase_save(st.session_state.game_id)
+            if ok:
+                st.success("已存到雲端 ✅")
+            else:
+                st.error(msg)
+
+        if cB.button("🔄 從雲端重新載入", use_container_width=True):
+            ok, msg, data = supabase_load_latest(st.session_state.game_id)
+            if ok and data:
+                restore_state(data)
+                st.success("已從雲端載入 ✅")
+                st.rerun()
+            elif ok:
+                st.warning("雲端沒有資料（新局）")
+            else:
+                st.error(msg)
+
+        with cC:
+            if st.button("🆕 開新局（換 gid）", use_container_width=True):
+                st.session_state["confirm_new_game"] = True
+
+        if st.session_state.get("confirm_new_game"):
+            st.warning("你確定要開新局嗎？（會清空目前畫面資料，但雲端歷史仍在舊 gid）")
+            x1, x2 = st.columns(2)
+            if x1.button("✅ 確定開新局", use_container_width=True):
+                st.session_state["confirm_new_game"] = False
+                _new_game_confirmed()
+            if x2.button("取消", use_container_width=True):
+                st.session_state["confirm_new_game"] = False
+
+        st.info(f"🆔 本局 game_id：`{st.session_state.game_id}`（URL 會帶 gid，重整不會變）")
+
+        b1, b2, b3 = st.columns([1, 1, 1])
+        if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
+            if len(st.session_state.events) == 0:
+                st.warning("目前沒有事件，無需結束。")
+            else:
+                end_current_session(s)
+                st.success("已封存本局並開始新局（雲端已保存）。")
+                st.rerun()
+
+        if b2.button("🧹 清空本局（保留封存）", use_container_width=True):
+            st.session_state.events = []
+            st.session_state["reset_hand_inputs"] = True
+            st.session_state["reset_pen_inputs"] = True
+            # 快速面板/鎖座位狀態也一併重置，避免下一將混亂
+            st.session_state.seat_locked = False
+            st.session_state.quick_actor_seat = None
+            st.session_state.quick_action = None
+            supabase_save(st.session_state.game_id)
+            st.rerun()
+
+        if b3.button("🗑️ 清空全部（本局+封存）", use_container_width=True):
+            st.session_state.events = []
+            st.session_state.sessions = []
+            st.session_state.selected_seat = None
+            st.session_state["reset_hand_inputs"] = True
+            st.session_state["reset_pen_inputs"] = True
+            st.session_state.seat_locked = False
+            st.session_state.quick_actor_seat = None
+            st.session_state.quick_action = None
+            supabase_save(st.session_state.game_id)
+            st.rerun()
 
 
 def page_overview(s: Settings):
