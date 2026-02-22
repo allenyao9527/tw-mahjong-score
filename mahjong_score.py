@@ -16,7 +16,7 @@ except Exception:
     create_client = None
     Client = None  # type: ignore
 
-APP_VERSION = "v2026-02-22_quick_embed_v2_safe_4"
+APP_VERSION = "v2026-02-22_quick_embed_v2_safe_5"
 WINDS = ["東", "南", "西", "北"]
 
 SUPABASE_TABLE = "game_states"  # public.game_states
@@ -742,70 +742,6 @@ def page_record(s: Settings):
     render_seat_map(s, sum_df, dealer_seat=ds)
 
     st.divider()
-
-    # 雲端/局管理
-    cA, cB, cC = st.columns([1, 1, 1])
-    if cA.button("💾 立即存檔到雲端", use_container_width=True):
-        ok, msg = supabase_save(st.session_state.game_id)
-        if ok:
-            st.success("已存到雲端 ✅")
-        else:
-            st.error(msg)
-
-    if cB.button("🔄 從雲端重新載入", use_container_width=True):
-        ok, msg, data = supabase_load_latest(st.session_state.game_id)
-        if ok and data:
-            restore_state(data)
-            st.success("已從雲端載入 ✅")
-            st.rerun()
-        elif ok:
-            st.warning("雲端沒有資料（新局）")
-        else:
-            st.error(msg)
-
-    with cC:
-        if st.button("🆕 開新局（換 gid）", use_container_width=True):
-            st.session_state["confirm_new_game"] = True
-
-    if st.session_state.get("confirm_new_game"):
-        st.warning("你確定要開新局嗎？（會清空目前畫面資料，但雲端歷史仍在舊 gid）")
-        x1, x2 = st.columns(2)
-        if x1.button("✅ 確定開新局", use_container_width=True):
-            st.session_state["confirm_new_game"] = False
-            _new_game_confirmed()
-        if x2.button("取消", use_container_width=True):
-            st.session_state["confirm_new_game"] = False
-
-    st.info(f"🆔 本局 game_id：`{st.session_state.game_id}`（URL 會帶 gid，重整不會變）")
-
-    st.divider()
-
-    # 牌局封存（同 gid 下）
-    b1, b2, b3 = st.columns([1, 1, 1])
-    if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
-        if len(st.session_state.events) == 0:
-            st.warning("目前沒有事件，無需結束。")
-        else:
-            end_current_session(s)
-            st.success("已封存本局並開始新局（雲端已保存）。")
-            st.rerun()
-
-    if b2.button("🧹 清空本局（保留封存）", use_container_width=True):
-        st.session_state.events = []
-        st.session_state["reset_hand_inputs"] = True
-        st.session_state["reset_pen_inputs"] = True
-        supabase_save(st.session_state.game_id)
-        st.rerun()
-
-    if b3.button("🗑️ 清空全部（本局+封存）", use_container_width=True):
-        st.session_state.events = []
-        st.session_state.sessions = []
-        st.session_state.selected_seat = None
-        st.session_state["reset_hand_inputs"] = True
-        st.session_state["reset_pen_inputs"] = True
-        supabase_save(st.session_state.game_id)
-        st.rerun()
-
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
 
     if mode == "一般":
@@ -914,14 +850,14 @@ def page_record(s: Settings):
     with st.expander("☁️ 雲端存檔 / 開新局 / 封存（放在頁面底部）", expanded=False):
         cA, cB, cC = st.columns([1, 1, 1])
 
-        if cA.button("💾 立即存檔到雲端", use_container_width=True):
+        if cA.button("💾 立即存檔到雲端", use_container_width=True, key="cloud_save_bottom"):
             ok, msg = supabase_save(st.session_state.game_id)
             if ok:
                 st.success("已存到雲端 ✅")
             else:
                 st.error(msg)
 
-        if cB.button("🔄 從雲端重新載入", use_container_width=True):
+        if cB.button("🔄 從雲端重新載入", use_container_width=True, key="cloud_reload_bottom"):
             ok, msg, data = supabase_load_latest(st.session_state.game_id)
             if ok and data:
                 restore_state(data)
@@ -933,22 +869,22 @@ def page_record(s: Settings):
                 st.error(msg)
 
         with cC:
-            if st.button("🆕 開新局（換 gid）", use_container_width=True):
+            if st.button("🆕 開新局（換 gid）", use_container_width=True, key="cloud_newgid_bottom"):
                 st.session_state["confirm_new_game"] = True
 
         if st.session_state.get("confirm_new_game"):
             st.warning("你確定要開新局嗎？（會清空目前畫面資料，但雲端歷史仍在舊 gid）")
             x1, x2 = st.columns(2)
-            if x1.button("✅ 確定開新局", use_container_width=True):
+            if x1.button("✅ 確定開新局", use_container_width=True, key="cloud_newgid_confirm"):
                 st.session_state["confirm_new_game"] = False
                 _new_game_confirmed()
-            if x2.button("取消", use_container_width=True):
+            if x2.button("取消", use_container_width=True, key="cloud_newgid_cancel"):
                 st.session_state["confirm_new_game"] = False
 
         st.info(f"🆔 本局 game_id：`{st.session_state.game_id}`（URL 會帶 gid，重整不會變）")
 
         b1, b2, b3 = st.columns([1, 1, 1])
-        if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True):
+        if b1.button("🏁 結束牌局（封存並新開）", use_container_width=True, key="cloud_end_session_bottom"):
             if len(st.session_state.events) == 0:
                 st.warning("目前沒有事件，無需結束。")
             else:
@@ -956,7 +892,7 @@ def page_record(s: Settings):
                 st.success("已封存本局並開始新局（雲端已保存）。")
                 st.rerun()
 
-        if b2.button("🧹 清空本局（保留封存）", use_container_width=True):
+        if b2.button("🧹 清空本局（保留封存）", use_container_width=True, key="cloud_clear_current_bottom"):
             st.session_state.events = []
             st.session_state["reset_hand_inputs"] = True
             st.session_state["reset_pen_inputs"] = True
@@ -967,7 +903,7 @@ def page_record(s: Settings):
             supabase_save(st.session_state.game_id)
             st.rerun()
 
-        if b3.button("🗑️ 清空全部（本局+封存）", use_container_width=True):
+        if b3.button("🗑️ 清空全部（本局+封存）", use_container_width=True, key="cloud_clear_all_bottom"):
             st.session_state.events = []
             st.session_state.sessions = []
             st.session_state.selected_seat = None
