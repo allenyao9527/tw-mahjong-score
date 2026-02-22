@@ -372,6 +372,8 @@ def init_state():
     st.session_state.setdefault("seat_locked", False)  # 與 hand_active 同步
     st.session_state.setdefault("hand_active", False)  # 本將是否開始
     st.session_state.setdefault("hand_started_at", None)  # 可選：開始本將時間
+    _players = st.session_state.get("settings", Settings()).players
+    st.session_state.setdefault("scores_by_player", {p: 0 for p in _players})
     st.session_state.setdefault("debug", True)
 
     # UI state (reactive widgets keys)
@@ -752,14 +754,35 @@ def page_settings(s: Settings):
         st.rerun()
 
 
-def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, daily_sum_df: Optional[pd.DataFrame] = None):
-    """sum_df=本將分數，daily_sum_df=當天累計總分（未給則用 sum_df）。"""
-    display_df = daily_sum_df if daily_sum_df is not None and not daily_sum_df.empty else sum_df
+def _build_scores_view(s: Settings, daily_sum_df: pd.DataFrame) -> Tuple[Dict[str, str], List[int]]:
+    """從 daily_sum_df 更新 scores_by_player，產生 seat_map 與 scores_view_by_seat（顯示用，不寫回結算）。"""
+    scores_by_player = {p: 0 for p in s.players}
+    if daily_sum_df is not None and not daily_sum_df.empty:
+        for _, row in daily_sum_df.iterrows():
+            p = row.get("玩家")
+            if p in scores_by_player:
+                scores_by_player[p] = int(row.get("總分", 0))
+    st.session_state["scores_by_player"] = scores_by_player
+    seat_map = {WINDS[i]: s.players[s.seat_players[i]] for i in range(4)}
+    scores_view_by_seat = [
+        scores_by_player.get(seat_map["東"], 0),
+        scores_by_player.get(seat_map["南"], 0),
+        scores_by_player.get(seat_map["西"], 0),
+        scores_by_player.get(seat_map["北"], 0),
+    ]
+    return seat_map, scores_view_by_seat
 
+
+def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, daily_sum_df: Optional[pd.DataFrame] = None, scores_view_by_seat: Optional[List[int]] = None):
+    """sum_df=本將分數，daily_sum_df=當天累計總分。scores_view_by_seat 提供時以「分數跟人走」顯示。"""
     def seat_btn(seat_idx: int, container):
         pid = s.seat_players[seat_idx]
         name = s.players[pid]
-        score = int(display_df.loc[display_df["玩家"] == name, "總分"].values[0]) if not display_df.empty else 0
+        if scores_view_by_seat is not None:
+            score = scores_view_by_seat[seat_idx]
+        else:
+            display_df = daily_sum_df if daily_sum_df is not None and not daily_sum_df.empty else sum_df
+            score = int(display_df.loc[display_df["玩家"] == name, "總分"].values[0]) if not display_df.empty else 0
         is_dealer = (seat_idx == dealer_seat)
         mark = " 🀄" if is_dealer else ""
         prefix = "👉 " if st.session_state.selected_seat == seat_idx else ""
@@ -891,7 +914,16 @@ def page_record(s: Settings):
     st.caption("莊家依局數固定：東→南→西→北（只能調整玩家座位，不可手動改莊位）。" + lock_note)
 
     st.divider()
-    render_seat_map(s, sum_df, dealer_seat=ds, daily_sum_df=daily_sum_df)
+    seat_map, scores_view_by_seat = _build_scores_view(s, daily_sum_df)
+    render_seat_map(s, sum_df, dealer_seat=ds, daily_sum_df=daily_sum_df, scores_view_by_seat=scores_view_by_seat)
+
+    with st.expander("DEBUG Scores Mapping", expanded=False):
+        gid = st.session_state.get("game_id", "")
+        scores_bp = st.session_state.get("scores_by_player", {})
+        st.write("gid:", gid)
+        st.write("seat_map:", seat_map)
+        st.write("scores_by_player:", scores_bp)
+        st.write("scores_view_by_seat:", scores_view_by_seat)
 
     # ---------- B: 快速輸入面板（座位區塊下方，固定不往下滑） ----------
     qp_container = st.container()
@@ -1128,6 +1160,15 @@ def page_overview(s: Settings):
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, st.session_state.events)
     daily_sum_df = compute_daily_total(s)
     merged = pd.merge(sum_df, stats_df, on="玩家", how="left")
+    seat_map, scores_view_by_seat = _build_scores_view(s, daily_sum_df)
+
+    with st.expander("DEBUG Scores Mapping", expanded=False):
+        gid = st.session_state.get("game_id", "")
+        scores_bp = st.session_state.get("scores_by_player", {})
+        st.write("gid:", gid)
+        st.write("seat_map:", seat_map)
+        st.write("scores_by_player:", scores_bp)
+        st.write("scores_view_by_seat:", scores_view_by_seat)
 
     st.subheader("當天累計總分（sessions + 本將）")
     st.dataframe(daily_sum_df, hide_index=True, use_container_width=True)
