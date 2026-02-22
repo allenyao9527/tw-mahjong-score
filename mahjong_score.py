@@ -1,5 +1,6 @@
 # mahjong_score.py
 import json
+import os
 import uuid
 from datetime import datetime
 from dataclasses import dataclass, field, asdict, is_dataclass
@@ -16,10 +17,65 @@ except Exception:
     create_client = None
     Client = None  # type: ignore
 
-APP_VERSION = "v2026-02-22_quick_embed_v2_safe_5"
+APP_VERSION = "v2026-02-22_safe_6_mahjong_session"
 WINDS = ["東", "南", "西", "北"]
 
 SUPABASE_TABLE = "game_states"  # public.game_states
+LOCAL_SAVES_DIR = "local_saves"
+
+
+def local_save_state(gid: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+    """Save state to local file."""
+    try:
+        os.makedirs(LOCAL_SAVES_DIR, exist_ok=True)
+        safe_gid = "".join(c for c in str(gid) if c.isalnum() or c in "_-") or "default"
+        path = os.path.join(LOCAL_SAVES_DIR, f"{safe_gid}.json")
+        rec = {"state": payload, "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=0)
+        return True, "已存到本地"
+    except Exception as e:
+        return False, f"寫入本地失敗：{type(e).__name__}"
+
+
+def local_load_latest(gid: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Load latest state from local file."""
+    try:
+        safe_gid = "".join(c for c in str(gid) if c.isalnum() or c in "_-") or "default"
+        path = os.path.join(LOCAL_SAVES_DIR, f"{safe_gid}.json")
+        if not os.path.isfile(path):
+            return True, "本地沒有找到資料（這是新局）", None
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+        data = rec.get("state") if isinstance(rec, dict) else None
+        if not isinstance(data, dict):
+            return False, "本地資料格式錯誤", None
+        return True, "已從本地載入最新狀態", data
+    except Exception as e:
+        return False, f"讀取本地失敗：{type(e).__name__}", None
+
+
+def local_list_recent(limit: int = 10) -> List[Tuple[str, str]]:
+    """Return recent distinct game_ids from local saves."""
+    try:
+        if not os.path.isdir(LOCAL_SAVES_DIR):
+            return []
+        out: List[Tuple[str, str]] = []
+        for fn in os.listdir(LOCAL_SAVES_DIR):
+            if not fn.endswith(".json"):
+                continue
+            gid = fn[:-5]
+            path = os.path.join(LOCAL_SAVES_DIR, fn)
+            try:
+                mtime = os.path.getmtime(path)
+                ts = datetime.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                ts = ""
+            out.append((gid, ts))
+        out.sort(key=lambda x: x[1] or "", reverse=True)
+        return out[: int(limit)]
+    except Exception:
+        return []
 
 
 # ============================
@@ -155,6 +211,9 @@ def snapshot_state() -> Dict[str, Any]:
         "settings": settings_dict,
         "events": st.session_state.get("events", []),
         "sessions": st.session_state.get("sessions", []),
+        "hand_active": st.session_state.get("hand_active", False),
+        "hand_started_at": st.session_state.get("hand_started_at"),
+        "seat_locked": st.session_state.get("seat_locked", False),
     }
 
 
@@ -168,13 +227,21 @@ def restore_state(data: Dict[str, Any]) -> None:
             st.session_state.settings = Settings()
     st.session_state.events = data.get("events", []) or []
     st.session_state.sessions = data.get("sessions", []) or []
+    if "hand_active" in data:
+        ha = bool(data["hand_active"])
+        st.session_state["hand_active"] = ha
+        st.session_state["seat_locked"] = ha  # 與 hand_active 同步
+    elif "seat_locked" in data:
+        st.session_state["seat_locked"] = bool(data["seat_locked"])
+    if "hand_started_at" in data:
+        st.session_state["hand_started_at"] = data["hand_started_at"]
 
 
 def supabase_load_latest(game_id: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """Load latest state from Supabase for this game_id."""
     sb = st.session_state.get("sb_client")
     if sb is None:
-        return False, "Supabase 尚未連線（請在 Streamlit Cloud 設定 Secrets）", None
+        return local_load_latest(game_id)
 
     try:
         res = (
@@ -206,10 +273,10 @@ def supabase_load_latest(game_id: str) -> Tuple[bool, str, Optional[Dict[str, An
 def supabase_save(game_id: str) -> Tuple[bool, str]:
     """Save current snapshot into Supabase (insert a new row each time)."""
     sb = st.session_state.get("sb_client")
-    if sb is None:
-        return False, "Supabase 尚未連線（請在 Streamlit Cloud 設定 Secrets）"
-
     payload = snapshot_state()
+    if sb is None:
+        return local_save_state(game_id, payload)
+
     try:
         _ = (
             sb.table(SUPABASE_TABLE)
@@ -226,7 +293,8 @@ def supabase_list_recent_game_ids(limit: int = 10, scan_rows: int = 200) -> List
     """Return recent distinct game_ids with latest created_at (client-side dedupe)."""
     sb = st.session_state.get("sb_client")
     if sb is None:
-        return []
+        return local_list_recent(limit=limit)
+
     try:
         res = (
             sb.table(SUPABASE_TABLE)
@@ -300,6 +368,10 @@ def init_state():
     st.session_state.setdefault("sessions", [])     # 封存的牌局（同一個 game_id 下）
 
     st.session_state.setdefault("selected_seat", None)
+    st.session_state.setdefault("selected_pid", None)
+    st.session_state.setdefault("seat_locked", False)  # 與 hand_active 同步
+    st.session_state.setdefault("hand_active", False)  # 本將是否開始
+    st.session_state.setdefault("hand_started_at", None)  # 可選：開始本將時間
     st.session_state.setdefault("debug", True)
 
     # UI state (reactive widgets keys)
@@ -377,6 +449,25 @@ def normalize_events(events: List[Any]) -> List[Dict[str, Any]]:
     return [ev_to_dict(e) for e in events]
 
 
+def _all_events_for_daily_total() -> List[Dict[str, Any]]:
+    """合併所有 sessions 的 events + 本將 events，供當天累計總分計算。"""
+    sessions = st.session_state.get("sessions", [])
+    current = st.session_state.get("events", [])
+    merged: List[Dict[str, Any]] = []
+    for sess in sessions:
+        evs = sess.get("events", [])
+        merged.extend(normalize_events(evs) if evs else [])
+    merged.extend(normalize_events(current))
+    return merged
+
+
+def compute_daily_total(settings: Settings) -> pd.DataFrame:
+    """當天累計總分：所有 sessions + 本將 events 合併計算。"""
+    all_ev = _all_events_for_daily_total()
+    _, sum_df, _, _, _, _, _, _ = compute_game_state(settings, all_ev)
+    return sum_df
+
+
 # ============================
 # 4) Core compute
 # ============================
@@ -434,12 +525,15 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                     stats[w]["自摸"] += 1
 
                 if w == dealer_pid:
-                    desc = f"{names[w]} 自摸({tai}台) [莊]"
+                    auto_bonus = bool(getattr(settings, "auto_dealer_bonus", True))
+                    eff_tai = tai + bonus if auto_bonus else tai
+                    A_dealer = amount_A(settings, eff_tai)
+                    desc = f"{names[w]} 自摸({tai}+{bonus}台) [莊]" if auto_bonus else f"{names[w]} 自摸({tai}台) [莊]"
                     for p in range(n):
                         if p == w:
-                            delta[p] += 3 * A
+                            delta[p] += 3 * A_dealer
                         else:
-                            delta[p] -= A
+                            delta[p] -= A_dealer
                     dr += 1
                 else:
                     dealer_pay = amount_A(settings, tai + bonus)
@@ -465,7 +559,7 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
 
             elif result in ("放槍", "胡牌"):
                 if w == l:
-                    desc = "錯誤：胡牌者=放槍者"
+                    desc = "錯誤：贏家與輸家不能相同"
                 else:
                     if 0 <= w < n:
                         stats[w]["胡"] += 1
@@ -473,9 +567,12 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                         stats[l]["放槍"] += 1
 
                     if w == dealer_pid:
-                        desc = f"{names[w]} 胡 {names[l]}({tai}台) [莊]"
-                        delta[w] += A
-                        delta[l] -= A
+                        auto_bonus = bool(getattr(settings, "auto_dealer_bonus", True))
+                        eff_tai = tai + bonus if auto_bonus else tai
+                        A_dealer = amount_A(settings, eff_tai)
+                        desc = f"{names[w]} 胡 {names[l]}({tai}+{bonus}台) [莊]" if auto_bonus else f"{names[w]} 胡 {names[l]}({tai}台) [莊]"
+                        delta[w] += A_dealer
+                        delta[l] -= A_dealer
                         dr += 1
                     else:
                         if l == dealer_pid:
@@ -578,16 +675,24 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
 
 def _apply_reset_flags_before_widgets():
     if st.session_state.get("reset_hand_inputs"):
-        st.session_state["hand_res"] = "自摸"
-        st.session_state["hand_tai"] = 0
-        st.session_state["hand_win"] = 0
-        st.session_state["hand_lose"] = 0
+        for k in ("record_hand_res", "hand_res"):
+            st.session_state[k] = "自摸"
+        for k in ("record_hand_tai", "hand_tai"):
+            st.session_state[k] = 0
+        for k in ("record_hand_win", "hand_win"):
+            st.session_state[k] = 0
+        for k in ("record_hand_lose", "hand_lose"):
+            st.session_state[k] = 0
         st.session_state["reset_hand_inputs"] = False
 
     if st.session_state.get("reset_pen_inputs"):
-        st.session_state["pen_pt"] = "詐胡"
-        st.session_state["pen_off"] = 0
-        st.session_state["pen_vic"] = 0
+        for k in ("record_pen_pt", "pen_pt"):
+            st.session_state[k] = "詐胡"
+        for k in ("record_pen_off", "pen_off"):
+            st.session_state[k] = 0
+        for k in ("record_pen_vic", "pen_vic"):
+            st.session_state[k] = 0
+        st.session_state["record_pen_amt"] = int(st.session_state.settings.base)
         st.session_state["pen_amt"] = int(st.session_state.settings.base)
         st.session_state["reset_pen_inputs"] = False
 
@@ -599,19 +704,19 @@ def page_settings(s: Settings):
     st.header("⚙️ 設定")
     st.caption(f"版本：{APP_VERSION}")
 
-    with st.form("set_form"):
+    with st.form(key="set_main_form"):
         cols = st.columns(4)
-        new_players = [cols[i].text_input(f"玩家{i+1}", value=s.players[i], key=f"p_{i}") for i in range(4)]
+        new_players = [cols[i].text_input(f"玩家{i+1}", value=s.players[i], key=f"set_player_{i}") for i in range(4)]
 
         st.divider()
         c1, c2 = st.columns(2)
-        base = c1.number_input("底", min_value=0, value=int(s.base), step=50)
-        tai_value = c2.number_input("每台金額", min_value=0, value=int(s.tai_value), step=10)
+        base = c1.number_input("底", min_value=0, value=int(s.base), step=50, key="set_base")
+        tai_value = c2.number_input("每台金額", min_value=0, value=int(s.tai_value), step=10, key="set_tai_value")
 
         st.divider()
         cT1, cT2 = st.columns(2)
-        draw_keep = cT1.toggle("流局連莊", value=bool(s.draw_keeps_dealer))
-        auto_bonus = cT2.toggle("莊家加台自動計算", value=bool(getattr(s, "auto_dealer_bonus", True)), help="開啟後：台數只填牌型台；遇到莊家/連莊相關情境會自動加上莊連台。")
+        draw_keep = cT1.toggle("流局連莊", value=bool(s.draw_keeps_dealer), key="set_draw_keep")
+        auto_bonus = cT2.toggle("莊家加台自動計算", value=bool(getattr(s, "auto_dealer_bonus", True)), help="開啟後：台數只填牌型台；遇到莊家/連莊相關情境會自動加上莊連台。", key="set_auto_bonus")
 
         st.divider()
         st.subheader("東（可選）")
@@ -620,10 +725,11 @@ def page_settings(s: Settings):
             options=[0, 1, 2, 3],
             index=int(s.host_player_id),
             format_func=lambda pid: new_players[pid],
+            key="set_host",
         )
         c3, c4 = st.columns(2)
-        dong_x = c3.number_input("自摸扣東（每次）", min_value=0, value=int(s.dong_per_self_draw), step=10)
-        dong_cap = c4.number_input("東錢上限（累計）", min_value=0, value=int(s.dong_cap_total), step=50)
+        dong_x = c3.number_input("自摸扣東（每次）", min_value=0, value=int(s.dong_per_self_draw), step=10, key="set_dong_per")
+        dong_cap = c4.number_input("東錢上限（累計）", min_value=0, value=int(s.dong_cap_total), step=50, key="set_dong_cap")
 
         save = st.form_submit_button("💾 儲存設定", use_container_width=True)
 
@@ -646,26 +752,43 @@ def page_settings(s: Settings):
         st.rerun()
 
 
-def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int):
+def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, daily_sum_df: Optional[pd.DataFrame] = None):
+    """sum_df=本將分數，daily_sum_df=當天累計總分（未給則用 sum_df）。"""
+    display_df = daily_sum_df if daily_sum_df is not None and not daily_sum_df.empty else sum_df
+
     def seat_btn(seat_idx: int, container):
         pid = s.seat_players[seat_idx]
         name = s.players[pid]
-        score = int(sum_df.loc[sum_df["玩家"] == name, "總分"].values[0]) if not sum_df.empty else 0
+        score = int(display_df.loc[display_df["玩家"] == name, "總分"].values[0]) if not display_df.empty else 0
         is_dealer = (seat_idx == dealer_seat)
         mark = " 🀄" if is_dealer else ""
         prefix = "👉 " if st.session_state.selected_seat == seat_idx else ""
         label = f"{prefix}{WINDS[seat_idx]}：{name}{mark} (${score})"
 
-        if container.button(label, key=f"seatbtn_{seat_idx}", use_container_width=True):
-            if st.session_state.selected_seat is None:
-                st.session_state.selected_seat = seat_idx
-            else:
-                o = st.session_state.selected_seat
-                s.seat_players[o], s.seat_players[seat_idx] = s.seat_players[seat_idx], s.seat_players[o]
-                st.session_state.selected_seat = None
+        if container.button(label, key=f"record_seatbtn_{seat_idx}", use_container_width=True):
+            seat_locked = bool(st.session_state.get("seat_locked", False))
 
-            st.session_state.settings = s
-            supabase_save(st.session_state.game_id)
+            if seat_locked:
+                # 僅選取玩家/座位（顯示快速輸入面板），不交換
+                if st.session_state.selected_seat == seat_idx:
+                    st.session_state.selected_seat = None
+                    st.session_state.selected_pid = None  # 點同一人取消選取
+                else:
+                    st.session_state.selected_seat = seat_idx
+                    st.session_state.selected_pid = s.seat_players[seat_idx]
+            else:
+                # 交換座位模式
+                if st.session_state.selected_seat is None:
+                    st.session_state.selected_seat = seat_idx
+                    st.session_state.selected_pid = s.seat_players[seat_idx]
+                else:
+                    o = st.session_state.selected_seat
+                    s.seat_players[o], s.seat_players[seat_idx] = s.seat_players[seat_idx], s.seat_players[o]
+                    st.session_state.selected_seat = None
+                    st.session_state.selected_pid = None
+                    st.session_state.settings = s
+                    supabase_save(st.session_state.game_id)
+
             st.rerun()
 
     # 📱 Mobile: vertical order 東南西北
@@ -696,6 +819,7 @@ def end_current_session(s: Settings):
         "ended_at": stamp,
         "event_count": len(events),
         "dong_total": int(d_acc),
+        "events": [ev_to_dict(e) for e in events],  # 供當天累計總分合併計算
         "sum_df": sum_df.to_dict(orient="records"),
         "stats_df": stats_df.to_dict(orient="records"),
         "ledger_tail": ledger_df.tail(20).to_dict(orient="records"),
@@ -703,6 +827,9 @@ def end_current_session(s: Settings):
     st.session_state.sessions.append(session)
 
     st.session_state.events = []
+    st.session_state["selected_seat"] = None
+    st.session_state["seat_locked"] = False
+    st.session_state["hand_active"] = False
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
 
@@ -721,6 +848,8 @@ def _new_game_confirmed():
     st.session_state.events = []
     st.session_state.sessions = []
     st.session_state.selected_seat = None
+    st.session_state["hand_active"] = False
+    st.session_state["seat_locked"] = False
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
     st.session_state.cloud_loaded = True
@@ -734,51 +863,127 @@ def page_record(s: Settings):
     _apply_reset_flags_before_widgets()
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps = compute_game_state(s, st.session_state.events)
+    daily_sum_df = compute_daily_total(s)
+
+    mj_active = bool(st.session_state.get("hand_active", False))
+
+    # ---------- C: 開始本將 / 結束本將（座位區塊上面） ----------
+    c_start, c_end, c_sp = st.columns([1, 1, 2])
+    with c_start:
+        if not mj_active and st.button("✅ 開始本將", use_container_width=True, key="record_btn_start_mahjong"):
+            st.session_state["hand_active"] = True
+            st.session_state["seat_locked"] = True
+            st.session_state["hand_started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state["selected_seat"] = None
+            supabase_save(st.session_state.game_id)
+            st.rerun()
+    with c_end:
+        if mj_active and st.button("🏁 結束本將", use_container_width=True, key="record_btn_end_mahjong"):
+            if len(st.session_state.events) == 0:
+                st.warning("本將尚無事件，無需結束。")
+            else:
+                end_current_session(s)
+                st.success("已結束本將，事件已封存；當天累計總分保留。")
+                st.rerun()
 
     st.subheader(f"目前局數：{WINDS[rw]}{ds+1}局 (連{dr})")
-    st.caption("莊家依局數固定：東→南→西→北（只能調整玩家座位，不可手動改莊位）。")
+    lock_note = "｜本將進行中（座位已鎖）" if mj_active else ("｜座位已鎖定" if st.session_state.get("seat_locked", False) else "")
+    st.caption("莊家依局數固定：東→南→西→北（只能調整玩家座位，不可手動改莊位）。" + lock_note)
 
     st.divider()
-    render_seat_map(s, sum_df, dealer_seat=ds)
+    render_seat_map(s, sum_df, dealer_seat=ds, daily_sum_df=daily_sum_df)
+
+    # ---------- B: 快速輸入面板（座位區塊下方，固定不往下滑） ----------
+    qp_container = st.container()
+    with qp_container:
+        sel_seat = st.session_state.get("selected_seat")
+        if sel_seat is not None:
+            pid = s.seat_players[sel_seat]
+            st.caption(f"快速輸入（已選 {s.players[pid]}）")
+            qp_res = st.selectbox("結果", ["自摸", "胡牌", "流局"], key=f"qp_res_{pid}")
+            qp_tai = 0
+            if qp_res in ("自摸", "胡牌"):
+                qp_tai = st.number_input("台數", min_value=0, step=1, key=f"qp_tai_{pid}")
+            qp_win = pid
+            qp_lose = 0
+            if qp_res in ("自摸", "胡牌"):
+                qp_win = st.selectbox("贏家", [0, 1, 2, 3], index=pid, format_func=lambda x: s.players[x], key=f"qp_win_{pid}")
+            if qp_res == "胡牌":
+                lose_opts = [p for p in [0, 1, 2, 3] if p != int(qp_win)]
+                qp_lose = st.selectbox("輸家", lose_opts, format_func=lambda x: s.players[x], key=f"qp_lose_{pid}")
+            if st.button("✅ 提交", use_container_width=True, key=f"qp_submit_{pid}"):
+                if qp_res == "胡牌" and int(qp_win) == int(qp_lose):
+                    st.error("胡牌時：贏家與輸家不能相同")
+                else:
+                    ev: Dict[str, Any] = {
+                        "_type": "hand",
+                        "result": "放槍" if qp_res == "胡牌" else qp_res,
+                        "winner_id": int(qp_win) if qp_res in ("自摸", "胡牌") else None,
+                        "loser_id": int(qp_lose) if qp_res == "胡牌" else None,
+                        "tai": int(qp_tai) if qp_res in ("自摸", "胡牌") else 0,
+                    }
+                    st.session_state.events.append(ev)
+                    st.session_state["selected_seat"] = None
+                    st.session_state["reset_hand_inputs"] = True
+                    supabase_save(st.session_state.game_id)
+                    st.rerun()
 
     st.divider()
-    mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True)
+    # 🔒 座位鎖定（避免手機誤觸換位；本將進行中時座位由開始本將鎖定）
+    lock_label = "🔒 鎖定座位（避免誤觸換位）" if not st.session_state.get("seat_locked", False) else "🔓 解鎖座位（可換位）"
+    if mj_active:
+        st.caption("本將進行中：座位已鎖定，請先『結束本將』才能換位。")
+    if st.button(lock_label, use_container_width=True, key="record_btn_toggle_seat_lock", disabled=mj_active):
+        if not mj_active:
+            st.session_state["seat_locked"] = not bool(st.session_state.get("seat_locked", False))
+            st.session_state["selected_seat"] = None
+            supabase_save(st.session_state.game_id)
+            st.rerun()
+
+    if st.session_state.get("seat_locked", False) and not mj_active:
+        st.caption("✅ 目前座位已鎖定；如要換位請先按『解鎖座位』。")
+
+    st.divider()
+    mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True, key="record_mode_radio")
 
     if mode == "一般":
-        res = st.selectbox("結果", ["自摸", "放槍", "流局"], key="hand_res")
+        if st.session_state.get("record_hand_res") == "放槍":
+            st.session_state["record_hand_res"] = "胡牌"
+        res = st.selectbox("結果", ["自摸", "胡牌", "流局"], key="record_hand_res")
 
         # ✅ 流局不需要台數
         tai = 0
-        if res in ("自摸", "放槍"):
-            tai = st.number_input("台數", min_value=0, step=1, key="hand_tai")
+        if res in ("自摸", "胡牌"):
+            tai = st.number_input("台數", min_value=0, step=1, key="record_hand_tai")
         else:
             st.session_state["hand_tai"] = 0
 
         win = 0
         lose = 0
 
-        if res in ("自摸", "放槍"):
-            win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="hand_win")
+        if res in ("自摸", "胡牌"):
+            win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="record_hand_win")
 
-        # ✅ 放槍輸家下拉排除贏家
-        if res == "放槍":
+        # ✅ 胡牌時輸家下拉排除贏家
+        if res == "胡牌":
             lose_options = [p for p in [0, 1, 2, 3] if p != int(win)]
-            if st.session_state.get("hand_lose") == int(win):
-                st.session_state["hand_lose"] = lose_options[0]
-            lose = st.selectbox("放槍家", lose_options, format_func=lambda x: s.players[x], key="hand_lose")
+            cur_lose = st.session_state.get("record_hand_lose", st.session_state.get("hand_lose", 0))
+            if cur_lose == int(win):
+                st.session_state["record_hand_lose"] = lose_options[0]
+            lose = st.selectbox("輸家", lose_options, format_func=lambda x: s.players[x], key="record_hand_lose")
 
-        submit = st.button("✅ 提交結果", use_container_width=True)
+        submit = st.button("✅ 提交結果", use_container_width=True, key="record_btn_submit_hand")
         if submit:
-            if res == "放槍" and int(win) == int(lose):
-                st.error("放槍時：贏家與放槍家不能相同")
+            if res == "胡牌" and int(win) == int(lose):
+                st.error("胡牌時：贏家與輸家不能相同")
             else:
                 ev: Dict[str, Any] = {
                     "_type": "hand",
-                    "result": res,
+                    "result": "放槍" if res == "胡牌" else res,
                     "winner_id": int(win) if res in ("自摸", "胡牌") else None,
                     "loser_id": int(lose) if res == "胡牌" else None,
                 }
-                if res in ("自摸", "放槍"):
+                if res in ("自摸", "胡牌"):
                     ev["tai"] = int(tai)
 
                 st.session_state.events.append(ev)
@@ -788,16 +993,16 @@ def page_record(s: Settings):
                 st.rerun()
 
     else:
-        pt = st.selectbox("種類", ["詐胡", "詐摸"], key="pen_pt")
-        off = st.selectbox("違規者", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="pen_off")
+        pt = st.selectbox("種類", ["詐胡", "詐摸"], key="record_pen_pt")
+        off = st.selectbox("違規者", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="record_pen_off")
 
         vic = 0
         if pt == "詐胡":
-            vic = st.selectbox("賠付對象", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="pen_vic")
+            vic = st.selectbox("賠付對象", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="record_pen_vic")
 
-        amt = st.number_input("金額", min_value=0, step=50, key="pen_amt")
+        amt = st.number_input("金額", min_value=0, step=50, key="record_pen_amt")
 
-        submit = st.button("🚨 提交罰則", use_container_width=True)
+        submit = st.button("🚨 提交罰則", use_container_width=True, key="record_btn_submit_pen")
         if submit:
             ev = {
                 "_type": "penalty",
@@ -813,12 +1018,12 @@ def page_record(s: Settings):
             st.rerun()
 
     c1, c2 = st.columns(2)
-    if c1.button("🔙 撤銷上一筆", use_container_width=True):
+    if c1.button("🔙 撤銷上一筆", use_container_width=True, key="record_btn_undo"):
         if st.session_state.events:
             st.session_state.events.pop()
             supabase_save(st.session_state.game_id)
             st.rerun()
-    if c2.button("🧹 清空事件（只清本局事件）", use_container_width=True):
+    if c2.button("🧹 清空事件（只清本局事件）", use_container_width=True, key="record_btn_clear_events"):
         st.session_state.events = []
         st.session_state["reset_hand_inputs"] = True
         st.session_state["reset_pen_inputs"] = True
@@ -833,7 +1038,7 @@ def page_record(s: Settings):
 
     st.divider()
     st.subheader("DEBUG")
-    st.session_state.debug = st.toggle("顯示 Debug", value=bool(st.session_state.debug))
+    st.session_state.debug = st.toggle("顯示 Debug", value=bool(st.session_state.debug), key="record_debug_toggle")
     if st.session_state.debug:
         st.write("DEBUG cloud load msg:", st.session_state.get("cloud_load_msg", ""))
         st.write("DEBUG game_id:", st.session_state.game_id)
@@ -907,6 +1112,7 @@ def page_record(s: Settings):
             st.session_state.events = []
             st.session_state.sessions = []
             st.session_state.selected_seat = None
+            st.session_state["hand_active"] = False
             st.session_state["reset_hand_inputs"] = True
             st.session_state["reset_pen_inputs"] = True
             st.session_state.seat_locked = False
@@ -920,7 +1126,11 @@ def page_overview(s: Settings):
     st.header("📊 數據總覽")
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, st.session_state.events)
+    daily_sum_df = compute_daily_total(s)
     merged = pd.merge(sum_df, stats_df, on="玩家", how="left")
+
+    st.subheader("當天累計總分（sessions + 本將）")
+    st.dataframe(daily_sum_df, hide_index=True, use_container_width=True)
 
     st.subheader("本局：總分 + 行為統計")
     st.dataframe(merged, hide_index=True, use_container_width=True)
@@ -957,7 +1167,8 @@ def page_overview(s: Settings):
         min_value=1,
         max_value=len(st.session_state.sessions),
         value=len(st.session_state.sessions),
-        step=1
+        step=1,
+        key="overview_sess_idx",
     )
     sess = st.session_state.sessions[int(idx) - 1]
 
@@ -982,7 +1193,7 @@ def main():
 
     # ✅ stable mobile toggle (no Safari auto-redirect)
     mobile_on = _is_mobile_layout()
-    new_mobile_on = st.sidebar.toggle("📱 手機直式座位（東南西北）", value=mobile_on)
+    new_mobile_on = st.sidebar.toggle("📱 手機直式座位（東南西北）", value=mobile_on, key="sidebar_mobile_toggle")
     if new_mobile_on != mobile_on:
         set_mobile_layout(new_mobile_on)
 
@@ -1015,10 +1226,10 @@ def main():
                 format_func=fmt,
                 key="recent_gid_pick",
             )
-            if st.button("切換", use_container_width=True):
+            if st.button("切換", use_container_width=True, key="sidebar_btn_switch_gid"):
                 switch_to_game_id(pick)
 
-    page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1)
+    page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1, key="nav_radio")
 
     if page == "設定":
         page_settings(s)
