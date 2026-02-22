@@ -1,0 +1,4 @@
+__pycache__/
+local_saves/
+git/
+*.pyc
