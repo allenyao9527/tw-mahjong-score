@@ -3,13 +3,15 @@ import json
 import os
 import uuid
 from datetime import datetime
-from dataclasses import dataclass, field, asdict, is_dataclass
+from dataclasses import asdict, is_dataclass
 # ✅ 確保導入 Optional, Union 等，這對後續 compute_daily_total 的參數優化很重要
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components  # for iPhone Safari localStorage
+from models import Settings
+from engine import compute_game_state, ev_to_dict
 
 # Supabase
 try:
@@ -82,25 +84,6 @@ def local_list_recent(limit: int = 10) -> List[Tuple[str, str]]:
 # ============================
 # 1) Models
 # ============================
-@dataclass
-class Settings:
-    base: int = 300
-    tai_value: int = 100
-
-    # 預設玩家
-    players: List[str] = field(default_factory=lambda: ["玩家1", "玩家2", "玩家3", "玩家4"])
-    # seat_players[seat_idx] = player_id, seat_idx: 0=東 1=南 2=西 3=北
-    seat_players: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
-
-    draw_keeps_dealer: bool = True
-
-    # 東錢（可選）
-    host_player_id: int = 0
-    dong_per_self_draw: int = 0
-    dong_cap_total: int = 0
-
-    # ✅ 關鍵新增：確保莊家權重開關能正確序列化並存入雲端
-    auto_dealer_bonus: bool = True
 
 # ============================
 # 2) Supabase Bridge
@@ -437,51 +420,6 @@ def _apply_reset_flags_before_widgets():
         st.session_state["reset_pen_inputs"] = False
 
 
-def safe_int(x, default=0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def amount_A(settings: Settings, tai: int) -> int:
-    return safe_int(settings.base) + safe_int(tai) * safe_int(settings.tai_value)
-
-
-def dealer_bonus_tai(dealer_run: int) -> int:
-    """
-    上莊=1台, 連1=3台, 連2=5台, 連3=7台
-    => bonus = 1 + 2*dealer_run
-    """
-    return 1 + 2 * int(dealer_run)
-
-
-def ev_to_dict(ev: Any) -> Dict[str, Any]:
-    if isinstance(ev, dict):
-        d = dict(ev)
-    elif is_dataclass(ev):
-        d = asdict(ev)
-    else:
-        d = {}
-        for k in (
-            "result", "winner_id", "loser_id", "tai",
-            "p_type", "offender_id", "victim_id", "amount",
-        ):
-            if hasattr(ev, k):
-                d[k] = getattr(ev, k)
-
-    if "result" in d:
-        d["_type"] = "hand"
-    elif "p_type" in d:
-        d["_type"] = "penalty"
-    else:
-        d["_type"] = d.get("_type", "unknown")
-    return d
-
-
-def normalize_events(events: List[Any]) -> List[Dict[str, Any]]:
-    return [ev_to_dict(e) for e in events]
-
 def compute_daily_total(settings: Settings, cur_sum_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """計算當天累計總分：支持傳入已計算好的當前局分數(cur_sum_df)以優化效能。"""
     names = settings.players
@@ -563,222 +501,6 @@ def compute_daily_stats(settings: Settings, cur_stats_df: Optional[pd.DataFrame]
 # ============================
 # 4) Core compute
 # ============================
-def compute_game_state(settings: Settings, events_raw: List[Any]):
-    events = normalize_events(events_raw)
-
-    n = 4
-    names = settings.players
-    seat_players = settings.seat_players
-
-    cum = [0] * n
-    rows = []
-
-    rw, ds, dr, d_acc = 0, 0, 0, 0
-    debug_steps = []
-
-    stats = {pid: {"自摸": 0, "胡": 0, "放槍": 0, "詐胡": 0, "詐摸": 0} for pid in range(n)}
-
-    # ✅ 修正 1：定義安全的 label 顯示，防止 WINDS[4] 報錯
-    def hand_label(rw_idx: int, dealer_seat: int) -> str:
-        if rw_idx >= 4: 
-            return "本將結束"
-        # 使用 min(rw_idx, 3) 確保即使 rw 到達 4 也不會導致 WINDS 索引溢出
-        return f"{WINDS[min(rw_idx, 3)]}{dealer_seat + 1}局"
-
-    # ✅ 修正 2：移除 rw 的 % 4，讓 rw 可以正常增加到 4 作為結束判斷標記
-    def advance_dealer():
-        nonlocal rw, ds, dr
-        ds = (ds + 1) % 4
-        dr = 0
-        if ds == 0:
-            rw += 1
-
-    for idx, ev in enumerate(events, start=1):
-        delta = [0] * n
-        label = ""
-        desc = ""
-
-        # ✅ 修正 1：不 break，改用 continue。讓 ledger_df 能完整顯示所有事件，但不再計算。
-        if rw >= 4:
-            ev_type = ev.get("_type", "unknown")
-            label = "⚠️ 已結束"
-            desc = f"忽略事件：本將已結束 (type={ev_type})"
-            debug_steps.append(f"[ignored] idx={idx} rw={rw} ds={ds} dr={dr} type={ev_type}")
-
-            # 建立一列「總分不變」的帳目
-            row = {"#": idx, "類型": label, "說明": desc}
-            for p in range(n):
-                row[names[p]] = cum[p]
-            rows.append(row)
-            continue  # 🚩 跳過後續所有計算邏輯，直接處理下一個事件
-
-        # ✅ 修正 2：在確認 rw < 4 後，才安全取得莊家 ID 與權重
-        # 這樣可以保證 ds 不會發生越界錯誤
-        dealer_pid = seat_players[ds]
-        bonus = dealer_bonus_tai(dr)
-
-        if ev.get("_type") == "hand":
-            label = hand_label(rw, ds)
-
-            result = ev.get("result", "")
-            w = safe_int(ev.get("winner_id"), default=-1)
-            l = safe_int(ev.get("loser_id"), default=-1)
-            tai = safe_int(ev.get("tai", 0))
-            A = amount_A(settings, tai)
-
-            if result == "流局":
-                desc = "流局"
-                if settings.draw_keeps_dealer:
-                    dr += 1
-                else:
-                    # 這裡會呼叫你內部的 advance_dealer()
-                    # 它會處理 ds, dr, rw 的進位
-                    advance_dealer() 
-
-            elif result == "自摸":
-                if 0 <= w < n:
-                    stats[w]["自摸"] += 1
-
-                if w == dealer_pid:
-                    # ✅ 修正 3：使用正式定義的 auto_dealer_bonus 欄位
-                    auto_bonus = bool(getattr(settings, "auto_dealer_bonus", True))
-                    eff_tai = tai + bonus if auto_bonus else tai
-                    A_dealer = amount_A(settings, eff_tai)
-                    desc = f"{names[w]} 自摸({tai}+{bonus}台) [莊]" if auto_bonus else f"{names[w]} 自摸({tai}台) [莊]"
-                    for p in range(n):
-                        if p == w:
-                            delta[p] += 3 * A_dealer
-                        else:
-                            delta[p] -= A_dealer
-                    dr += 1
-                else:
-                    dealer_pay = amount_A(settings, tai + bonus)
-                    other_pay = A
-                    desc = f"{names[w]} 自摸({tai}台) [閒] (莊付{tai}+{bonus}台)"
-                    for p in range(n):
-                        if p == w:
-                            delta[p] += dealer_pay + 2 * other_pay
-                        elif p == dealer_pid:
-                            delta[p] -= dealer_pay
-                        else:
-                            delta[p] -= other_pay
-                    advance_dealer()
-            
-
-                # 東錢計算
-                if settings.dong_per_self_draw > 0 and settings.dong_cap_total > 0:
-                    remain = max(0, int(settings.dong_cap_total) - int(d_acc))
-                    take = min(int(settings.dong_per_self_draw), remain)
-                    if take > 0 and 0 <= w < n:
-                        delta[w] -= take
-                        delta[int(settings.host_player_id)] += take
-                        d_acc += take
-
-            elif result in ("放槍", "胡牌"):
-                if w == l:
-                    desc = "錯誤：贏家與輸家不能相同"
-                else:
-                    if 0 <= w < n:
-                        stats[w]["胡"] += 1
-                    if 0 <= l < n:
-                        stats[l]["放槍"] += 1
-
-                    if w == dealer_pid:
-                        auto_bonus = bool(getattr(settings, "auto_dealer_bonus", True))
-                        eff_tai = tai + bonus if auto_bonus else tai
-                        A_dealer = amount_A(settings, eff_tai)
-                        desc = f"{names[w]} 胡 {names[l]}({tai}+{bonus}台) [莊]" if auto_bonus else f"{names[w]} 胡 {names[l]}({tai}台) [莊]"
-                        delta[w] += A_dealer
-                        delta[l] -= A_dealer
-                        dr += 1
-                    else:
-                        if l == dealer_pid:
-                            pay = amount_A(settings, tai + bonus)
-                            desc = f"{names[w]} 胡 {names[l]}({tai}台) [閒胡莊] (莊付{tai}+{bonus}台)"
-                            delta[w] += pay
-                            delta[l] -= pay
-                        else:
-                            desc = f"{names[w]} 胡 {names[l]}({tai}台)"
-                            delta[w] += A
-                            delta[l] -= A
-                        advance_dealer()
-            else:
-                desc = f"未知牌局結果：{result}"
-
-        elif ev.get("_type") == "penalty":
-            label = hand_label(rw, ds)
-            p_type = ev.get("p_type", "")
-            amt = safe_int(ev.get("amount", 0))
-            dealer_paid = False
-
-            if p_type == "詐胡":
-                off = safe_int(ev.get("offender_id", 0))
-                vic = safe_int(ev.get("victim_id", 0))
-                if 0 <= off < n: stats[off]["詐胡"] += 1
-                desc = f"{names[off]} 詐胡→{names[vic]} (${amt})"
-                delta[off] -= amt
-                delta[vic] += amt
-                dealer_paid = (off == dealer_pid)
-
-            elif p_type == "詐摸":
-                off = safe_int(ev.get("offender_id", 0))
-                if 0 <= off < n: stats[off]["詐摸"] += 1
-                if off == dealer_pid:
-                    desc = f"{names[off]} 詐摸賠三家 (每家${amt}) [莊]"
-                    delta[off] -= 3 * amt
-                    for p in range(n):
-                        if p != off: delta[p] += amt
-                    dealer_paid = True
-                else:
-                    bonus_tai = dealer_bonus_tai(dr)
-                    dealer_extra = bonus_tai * int(settings.tai_value)
-                    other_non_dealers = [p for p in range(n) if p not in (off, dealer_pid)]
-                    for p in other_non_dealers:
-                        delta[off] -= amt
-                        delta[p] += amt
-                    pay_dealer = amt + dealer_extra
-                    delta[off] -= pay_dealer
-                    delta[dealer_pid] += pay_dealer
-                    desc = f"{names[off]} 詐摸[閒]：賠莊${pay_dealer}，賠閒各${amt}"
-                    dealer_paid = False
-
-            if dealer_paid:
-                advance_dealer()
-            else:
-                dr += 1
-        else:
-            label = "未知"
-            desc = "不支援事件"
-
-        # 累加分數
-        for p in range(n):
-            cum[p] += delta[p]
-
-        row = {"#": idx, "類型": label, "說明": desc}
-        for p in range(n):
-            row[names[p]] = cum[p]
-        rows.append(row)
-
-        # 重新用目前 ds 計算 dealer，避免 advance_dealer() 後顯示錯誤
-        if rw < 4:
-            debug_dealer = names[seat_players[ds]]
-        else:
-            debug_dealer = "N/A"
-
-        debug_steps.append(f"[#{idx}] ds={ds} dealer={debug_dealer} dr={dr} rw={rw} delta={delta} cum={cum}")
-
-    ledger_df = pd.DataFrame(rows)
-    sum_df = pd.DataFrame([{"玩家": names[i], "總分": cum[i]} for i in range(n)])
-    
-    stats_rows = []
-    for pid in range(n):
-        r = {"玩家": names[pid]}
-        r.update(stats[pid])
-        stats_rows.append(r)
-    stats_df = pd.DataFrame(stats_rows)
-
-    # ✅ 修正：不要在這裡 clamp，否則 UI 永遠判斷不到 rw >= 4 (結束狀態)
-    return ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps
 
 
 # ============================
@@ -1414,6 +1136,13 @@ def main():
             )
             if st.button("切換", use_container_width=True, key="sidebar_btn_switch_gid"):
                 switch_to_game_id(pick)
+    with st.sidebar.expander("引擎狀態檢查", expanded=False):
+        if st.button("執行空跑測試", use_container_width=True, key="sidebar_engine_selftest"):
+            try:
+                compute_game_state(s, [])
+                st.sidebar.success("計算引擎：正常 ✅")
+            except Exception:
+                st.sidebar.error("計算引擎：發生錯誤 ❌")
 
     page = st.sidebar.radio("導航", ["設定", "牌局錄入", "數據總覽"], index=1, key="nav_radio")
 
