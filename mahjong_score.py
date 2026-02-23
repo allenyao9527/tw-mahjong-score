@@ -407,6 +407,36 @@ def init_state():
         st.session_state.cloud_loaded = True
 
 
+def _apply_reset_flags_before_widgets():
+    """
+    在 UI widget 建立前，根據 reset flags 清掉對應 widget state，
+    避免上一筆資料殘留。
+    """
+    # 一般手牌輸入 reset
+    if st.session_state.get("reset_hand_inputs"):
+        for k in [
+            "record_hand_res",
+            "record_hand_tai",
+            "record_hand_win",
+            "record_hand_lose",
+        ]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.session_state["reset_hand_inputs"] = False
+
+    # 罰則輸入 reset
+    if st.session_state.get("reset_pen_inputs"):
+        for k in [
+            "record_pen_pt",
+            "record_pen_off",
+            "record_pen_vic",
+            "record_pen_amt",
+        ]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.session_state["reset_pen_inputs"] = False
+
+
 def safe_int(x, default=0) -> int:
     try:
         return int(x)
