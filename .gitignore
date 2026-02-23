@@ -1,5 +1,19 @@
+# Python
 __pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit secrets (本地才會用；線上用 Cloud Secrets)
+.streamlit/secrets.toml
+
+# local data
 local_saves/
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
 git/
 *.pycsearch.py 
 search.py 
