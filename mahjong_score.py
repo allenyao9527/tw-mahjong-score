@@ -4,7 +4,8 @@ import os
 import uuid
 from datetime import datetime
 from dataclasses import dataclass, field, asdict, is_dataclass
-from typing import List, Dict, Any, Optional, Tuple
+# ✅ 確保導入 Optional, Union 等，這對後續 compute_daily_total 的參數優化很重要
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 import pandas as pd
 import streamlit as st
@@ -98,6 +99,8 @@ class Settings:
     dong_per_self_draw: int = 0
     dong_cap_total: int = 0
 
+    # ✅ 關鍵新增：確保莊家權重開關能正確序列化並存入雲端
+    auto_dealer_bonus: bool = True
 
 # ============================
 # 2) Supabase Bridge
@@ -373,12 +376,11 @@ def init_state():
     st.session_state.setdefault("hand_active", False)  # 本將是否開始
     st.session_state.setdefault("hand_started_at", None)  # 可選：開始本將時間
     _players = st.session_state.get("settings", Settings()).players
-    st.session_state.setdefault("scores_by_player", {p: 0 for p in _players})
     st.session_state.setdefault("debug", True)
 
     # UI state (reactive widgets keys)
     st.session_state.setdefault("hand_res", "自摸")
-    st.session_state.setdefault("hand_tai", 0)
+    st.session_state.setdefault("record_hand_tai", 0)
     st.session_state.setdefault("hand_win", 0)
     st.session_state.setdefault("hand_lose", 0)
 
@@ -450,26 +452,84 @@ def ev_to_dict(ev: Any) -> Dict[str, Any]:
 def normalize_events(events: List[Any]) -> List[Dict[str, Any]]:
     return [ev_to_dict(e) for e in events]
 
+def compute_daily_total(settings: Settings, cur_sum_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """計算當天累計總分：支持傳入已計算好的當前局分數(cur_sum_df)以優化效能。"""
+    names = settings.players
+    total_scores = {p: 0 for p in names}
+    
+    # 1. 歷史分數 (加總過去已結束的將次)
+    for sess in st.session_state.get("sessions", []):
+        rows = sess.get("sum_df", [])
+        for row in rows:
+            p = row.get("玩家")
+            if p in total_scores:
+                total_scores[p] += int(row.get("總分", 0))
+                
+    # 2. 目前這一將的分數
+    if cur_sum_df is not None:
+        # ✅ 優化點：直接使用外部傳進來的結果
+        for _, row in cur_sum_df.iterrows():
+            p = row.get("玩家")
+            if p in total_scores:
+                total_scores[p] += int(row.get("總分", 0))
+    else:
+        # 降級方案：如果沒傳，才現場算
+        current_events = st.session_state.get("events", [])
+        if current_events:
+            _, tmp_sum, _, _, _, _, _, _ = compute_game_state(settings, current_events)
+            for _, row in tmp_sum.iterrows():
+                p = row.get("玩家")
+                if p in total_scores:
+                    total_scores[p] += int(row.get("總分", 0))
 
-def _all_events_for_daily_total() -> List[Dict[str, Any]]:
-    """合併所有 sessions 的 events + 本將 events，供當天累計總分計算。"""
-    sessions = st.session_state.get("sessions", [])
-    current = st.session_state.get("events", [])
-    merged: List[Dict[str, Any]] = []
-    for sess in sessions:
-        evs = sess.get("events", [])
-        merged.extend(normalize_events(evs) if evs else [])
-    merged.extend(normalize_events(current))
-    return merged
+    return pd.DataFrame([{"玩家": k, "總分": v} for k, v in total_scores.items()])
 
+# ✅ 1. 增加 Optional[pd.DataFrame] 參數，讓它能接收算好的結果
+def compute_daily_stats(settings: Settings, cur_stats_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """計算當天累計統計：支持傳入已計算好的當前局統計(cur_stats_df)以優化效能。"""
+    names = settings.players
+    stats_fields = ["自摸", "胡", "放槍", "詐胡", "詐摸"]
+    daily_stats = {p: {f: 0 for f in stats_fields} for p in names}
 
-def compute_daily_total(settings: Settings) -> pd.DataFrame:
-    """當天累計總分：所有 sessions + 本將 events 合併計算。"""
-    all_ev = _all_events_for_daily_total()
-    _, sum_df, _, _, _, _, _, _ = compute_game_state(settings, all_ev)
-    return sum_df
+    # 1. 加上過去已封存 sessions 的統計 (不變)
+    for sess in st.session_state.get("sessions", []):
+        hist_stats = sess.get("stats_df", [])
+        rows = hist_stats.to_dict('records') if isinstance(hist_stats, pd.DataFrame) else hist_stats
+        for row in rows:
+            p = row.get("玩家")
+            if p in daily_stats:
+                for f in stats_fields:
+                    daily_stats[p][f] += int(row.get(f, 0))
 
+    # 2. 加上目前進行中的即時統計
+    if cur_stats_df is not None:
+        # ✅ 2. 效能優化：如果外面算好了，直接用傳進來的結果
+        for _, row in cur_stats_df.iterrows():
+            p = row.get("玩家")
+            if p in daily_stats:
+                for f in stats_fields:
+                    daily_stats[p][f] += int(row.get(f, 0))
+    else:
+        # 降級方案：沒傳入才現場重算
+        current_events = st.session_state.get("events", [])
+        if current_events:
+            _, _, tmp_stats, _, _, _, _, _ = compute_game_state(settings, current_events)
+            for _, row in tmp_stats.iterrows():
+                p = row.get("玩家")
+                if p in daily_stats:
+                    for f in stats_fields:
+                        daily_stats[p][f] += int(row.get(f, 0))
 
+    # 3. 整理成 DataFrame 回傳 (不變)
+    output = []
+    for p_name in names:
+        r = {"玩家": p_name}
+        r.update(daily_stats[p_name])
+        output.append(r)
+    
+    return pd.DataFrame(output)
+
+                    
 # ============================
 # 4) Core compute
 # ============================
@@ -488,21 +548,42 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
 
     stats = {pid: {"自摸": 0, "胡": 0, "放槍": 0, "詐胡": 0, "詐摸": 0} for pid in range(n)}
 
+    # ✅ 修正 1：定義安全的 label 顯示，防止 WINDS[4] 報錯
     def hand_label(rw_idx: int, dealer_seat: int) -> str:
-        return f"{WINDS[rw_idx]}{dealer_seat + 1}局"
+        if rw_idx >= 4: 
+            return "本將結束"
+        # 使用 min(rw_idx, 3) 確保即使 rw 到達 4 也不會導致 WINDS 索引溢出
+        return f"{WINDS[min(rw_idx, 3)]}{dealer_seat + 1}局"
 
+    # ✅ 修正 2：移除 rw 的 % 4，讓 rw 可以正常增加到 4 作為結束判斷標記
     def advance_dealer():
         nonlocal rw, ds, dr
         ds = (ds + 1) % 4
         dr = 0
         if ds == 0:
-            rw = (rw + 1) % 4
+            rw += 1
 
     for idx, ev in enumerate(events, start=1):
         delta = [0] * n
         label = ""
         desc = ""
 
+        # ✅ 修正 1：不 break，改用 continue。讓 ledger_df 能完整顯示所有事件，但不再計算。
+        if rw >= 4:
+            ev_type = ev.get("_type", "unknown")
+            label = "⚠️ 已結束"
+            desc = f"忽略事件：本將已結束 (type={ev_type})"
+            debug_steps.append(f"[ignored] idx={idx} rw={rw} ds={ds} dr={dr} type={ev_type}")
+
+            # 建立一列「總分不變」的帳目
+            row = {"#": idx, "類型": label, "說明": desc}
+            for p in range(n):
+                row[names[p]] = cum[p]
+            rows.append(row)
+            continue  # 🚩 跳過後續所有計算邏輯，直接處理下一個事件
+
+        # ✅ 修正 2：在確認 rw < 4 後，才安全取得莊家 ID 與權重
+        # 這樣可以保證 ds 不會發生越界錯誤
         dealer_pid = seat_players[ds]
         bonus = dealer_bonus_tai(dr)
 
@@ -520,13 +601,16 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                 if settings.draw_keeps_dealer:
                     dr += 1
                 else:
-                    advance_dealer()
+                    # 這裡會呼叫你內部的 advance_dealer()
+                    # 它會處理 ds, dr, rw 的進位
+                    advance_dealer() 
 
             elif result == "自摸":
                 if 0 <= w < n:
                     stats[w]["自摸"] += 1
 
                 if w == dealer_pid:
+                    # ✅ 修正 3：使用正式定義的 auto_dealer_bonus 欄位
                     auto_bonus = bool(getattr(settings, "auto_dealer_bonus", True))
                     eff_tai = tai + bonus if auto_bonus else tai
                     A_dealer = amount_A(settings, eff_tai)
@@ -549,8 +633,9 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
                         else:
                             delta[p] -= other_pay
                     advance_dealer()
+            
 
-                # 東錢（可選）
+                # 東錢計算
                 if settings.dong_per_self_draw > 0 and settings.dong_cap_total > 0:
                     remain = max(0, int(settings.dong_cap_total) - int(d_acc))
                     take = min(int(settings.dong_per_self_draw), remain)
@@ -594,15 +679,12 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             label = hand_label(rw, ds)
             p_type = ev.get("p_type", "")
             amt = safe_int(ev.get("amount", 0))
-
             dealer_paid = False
 
             if p_type == "詐胡":
                 off = safe_int(ev.get("offender_id", 0))
                 vic = safe_int(ev.get("victim_id", 0))
-                if 0 <= off < n:
-                    stats[off]["詐胡"] += 1
-
+                if 0 <= off < n: stats[off]["詐胡"] += 1
                 desc = f"{names[off]} 詐胡→{names[vic]} (${amt})"
                 delta[off] -= amt
                 delta[vic] += amt
@@ -610,46 +692,35 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
 
             elif p_type == "詐摸":
                 off = safe_int(ev.get("offender_id", 0))
-                if 0 <= off < n:
-                    stats[off]["詐摸"] += 1
-
+                if 0 <= off < n: stats[off]["詐摸"] += 1
                 if off == dealer_pid:
                     desc = f"{names[off]} 詐摸賠三家 (每家${amt}) [莊]"
                     delta[off] -= 3 * amt
                     for p in range(n):
-                        if p != off:
-                            delta[p] += amt
+                        if p != off: delta[p] += amt
                     dealer_paid = True
                 else:
                     bonus_tai = dealer_bonus_tai(dr)
                     dealer_extra = bonus_tai * int(settings.tai_value)
-
                     other_non_dealers = [p for p in range(n) if p not in (off, dealer_pid)]
                     for p in other_non_dealers:
                         delta[off] -= amt
                         delta[p] += amt
-
                     pay_dealer = amt + dealer_extra
                     delta[off] -= pay_dealer
                     delta[dealer_pid] += pay_dealer
-
-                    desc = (
-                        f"{names[off]} 詐摸[閒]：賠兩閒各${amt}；"
-                        f"賠莊${amt}+{bonus_tai}台(每台{int(settings.tai_value)})=${pay_dealer}"
-                    )
+                    desc = f"{names[off]} 詐摸[閒]：賠莊${pay_dealer}，賠閒各${amt}"
                     dealer_paid = False
-            else:
-                desc = f"未知罰則類型：{p_type}"
 
             if dealer_paid:
                 advance_dealer()
             else:
                 dr += 1
-
         else:
             label = "未知"
-            desc = f"不支援事件型別：{type(events_raw[idx-1])}"
+            desc = "不支援事件"
 
+        # 累加分數
         for p in range(n):
             cum[p] += delta[p]
 
@@ -658,13 +729,17 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
             row[names[p]] = cum[p]
         rows.append(row)
 
-        debug_steps.append(
-            f"[#{idx}] ds={ds} dealer={names[dealer_pid]} dr={dr} rw={rw} bonusTai={bonus} delta={delta} cum={cum}"
-        )
+        # 重新用目前 ds 計算 dealer，避免 advance_dealer() 後顯示錯誤
+        if rw < 4:
+            debug_dealer = names[seat_players[ds]]
+        else:
+            debug_dealer = "N/A"
+
+        debug_steps.append(f"[#{idx}] ds={ds} dealer={debug_dealer} dr={dr} rw={rw} delta={delta} cum={cum}")
 
     ledger_df = pd.DataFrame(rows)
     sum_df = pd.DataFrame([{"玩家": names[i], "總分": cum[i]} for i in range(n)])
-
+    
     stats_rows = []
     for pid in range(n):
         r = {"玩家": names[pid]}
@@ -672,31 +747,8 @@ def compute_game_state(settings: Settings, events_raw: List[Any]):
         stats_rows.append(r)
     stats_df = pd.DataFrame(stats_rows)
 
+    # ✅ 修正：不要在這裡 clamp，否則 UI 永遠判斷不到 rw >= 4 (結束狀態)
     return ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps
-
-
-def _apply_reset_flags_before_widgets():
-    if st.session_state.get("reset_hand_inputs"):
-        for k in ("record_hand_res", "hand_res"):
-            st.session_state[k] = "自摸"
-        for k in ("record_hand_tai", "hand_tai"):
-            st.session_state[k] = 0
-        for k in ("record_hand_win", "hand_win"):
-            st.session_state[k] = 0
-        for k in ("record_hand_lose", "hand_lose"):
-            st.session_state[k] = 0
-        st.session_state["reset_hand_inputs"] = False
-
-    if st.session_state.get("reset_pen_inputs"):
-        for k in ("record_pen_pt", "pen_pt"):
-            st.session_state[k] = "詐胡"
-        for k in ("record_pen_off", "pen_off"):
-            st.session_state[k] = 0
-        for k in ("record_pen_vic", "pen_vic"):
-            st.session_state[k] = 0
-        st.session_state["record_pen_amt"] = int(st.session_state.settings.base)
-        st.session_state["pen_amt"] = int(st.session_state.settings.base)
-        st.session_state["reset_pen_inputs"] = False
 
 
 # ============================
@@ -754,22 +806,30 @@ def page_settings(s: Settings):
         st.rerun()
 
 
-def _build_scores_view(s: Settings, daily_sum_df: pd.DataFrame) -> Tuple[Dict[str, str], List[int]]:
-    """從 daily_sum_df 更新 scores_by_player，產生 seat_map 與 scores_view_by_seat（顯示用，不寫回結算）。"""
-    scores_by_player = {p: 0 for p in s.players}
+def _build_scores_view(s: Settings, daily_sum_df: Optional[pd.DataFrame] = None) -> Tuple[Dict[str, str], List[int]]:
+    """
+    建立座位排版視圖。
+    完全由傳入的 daily_sum_df 決定分數，不再讀寫 session_state["scores_by_player"]。
+    """
+    # 1. 產生方位對照表 (方位 -> 玩家名)
+    seat_map = {WINDS[i]: s.players[s.seat_players[i]] for i in range(4)}
+
+    # 2. 準備當前所有玩家的分數對照表
+    current_scores = {p: 0 for p in s.players}
     if daily_sum_df is not None and not daily_sum_df.empty:
         for _, row in daily_sum_df.iterrows():
-            p = row.get("玩家")
-            if p in scores_by_player:
-                scores_by_player[p] = int(row.get("總分", 0))
-    st.session_state["scores_by_player"] = scores_by_player
-    seat_map = {WINDS[i]: s.players[s.seat_players[i]] for i in range(4)}
+            p_name = row.get("玩家")
+            if p_name in current_scores:
+                current_scores[p_name] = int(row.get("總分", 0))
+
+    # 3. 依照「東南西北」座位順序提取分數
     scores_view_by_seat = [
-        scores_by_player.get(seat_map["東"], 0),
-        scores_by_player.get(seat_map["南"], 0),
-        scores_by_player.get(seat_map["西"], 0),
-        scores_by_player.get(seat_map["北"], 0),
+        current_scores.get(seat_map["東"], 0),
+        current_scores.get(seat_map["南"], 0),
+        current_scores.get(seat_map["西"], 0),
+        current_scores.get(seat_map["北"], 0),
     ]
+
     return seat_map, scores_view_by_seat
 
 
@@ -782,7 +842,10 @@ def render_seat_map(s: Settings, sum_df: pd.DataFrame, dealer_seat: int, daily_s
             score = scores_view_by_seat[seat_idx]
         else:
             display_df = daily_sum_df if daily_sum_df is not None and not daily_sum_df.empty else sum_df
-            score = int(display_df.loc[display_df["玩家"] == name, "總分"].values[0]) if not display_df.empty else 0
+
+            # ✅ 改用這段安全取值：先檢查長度，避免 IndexError
+            vals = display_df.loc[display_df["玩家"] == name, "總分"].values
+            score = int(vals[0]) if len(vals) > 0 else 0
         is_dealer = (seat_idx == dealer_seat)
         mark = " 🀄" if is_dealer else ""
         prefix = "👉 " if st.session_state.selected_seat == seat_idx else ""
@@ -855,6 +918,7 @@ def end_current_session(s: Settings):
     st.session_state["hand_active"] = False
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
+    st.session_state["_game_over_warned"] = False
 
     supabase_save(st.session_state.game_id)
 
@@ -876,6 +940,7 @@ def _new_game_confirmed():
     st.session_state["reset_hand_inputs"] = True
     st.session_state["reset_pen_inputs"] = True
     st.session_state.cloud_loaded = True
+    st.session_state["_game_over_warned"] = False
     supabase_save(st.session_state.game_id)
     st.rerun()
 
@@ -886,20 +951,31 @@ def page_record(s: Settings):
     _apply_reset_flags_before_widgets()
 
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, debug_steps = compute_game_state(s, st.session_state.events)
-    daily_sum_df = compute_daily_total(s)
+
+    # ✅ 避免 compute_daily_total 內部又重算一次 compute_game_state
+    daily_sum_df = compute_daily_total(s, cur_sum_df=sum_df)
 
     mj_active = bool(st.session_state.get("hand_active", False))
+
+    # ✅ 全頁共用：本將是否已結束（北四打完）
+    is_game_over = (rw >= 4)
+
+    # 若本將已結束，強制同步狀態，避免殘留 hand_active / seat_locked
+    if is_game_over:
+        st.session_state["hand_active"] = False
+        st.session_state["seat_locked"] = False
 
     # ---------- C: 開始本將 / 結束本將（座位區塊上面） ----------
     c_start, c_end, c_sp = st.columns([1, 1, 2])
     with c_start:
-        if not mj_active and st.button("✅ 開始本將", use_container_width=True, key="record_btn_start_mahjong"):
+        if (not mj_active) and st.button("✅ 開始本將", use_container_width=True, key="record_btn_start_mahjong"):
             st.session_state["hand_active"] = True
             st.session_state["seat_locked"] = True
             st.session_state["hand_started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.session_state["selected_seat"] = None
             supabase_save(st.session_state.game_id)
             st.rerun()
+
     with c_end:
         if mj_active and st.button("🏁 結束本將", use_container_width=True, key="record_btn_end_mahjong"):
             if len(st.session_state.events) == 0:
@@ -909,20 +985,24 @@ def page_record(s: Settings):
                 st.success("已結束本將，事件已封存；當天累計總分保留。")
                 st.rerun()
 
-    st.subheader(f"目前局數：{WINDS[rw]}{ds+1}局 (連{dr})")
+    # 判斷是否已經打完四圈（顯示用）
+    safe_wind = WINDS[min(rw, 3)]
+    hand_status_text = f"{safe_wind}{ds+1}局" if rw < 4 else "本將已結束"
+    st.subheader(f"🀄 {hand_status_text} (連{dr})")
+
     lock_note = "｜本將進行中（座位已鎖）" if mj_active else ("｜座位已鎖定" if st.session_state.get("seat_locked", False) else "")
     st.caption("莊家依局數固定：東→南→西→北（只能調整玩家座位，不可手動改莊位）。" + lock_note)
 
     st.divider()
+
     seat_map, scores_view_by_seat = _build_scores_view(s, daily_sum_df)
     render_seat_map(s, sum_df, dealer_seat=ds, daily_sum_df=daily_sum_df, scores_view_by_seat=scores_view_by_seat)
 
     with st.expander("DEBUG Scores Mapping", expanded=False):
         gid = st.session_state.get("game_id", "")
-        scores_bp = st.session_state.get("scores_by_player", {})
         st.write("gid:", gid)
         st.write("seat_map:", seat_map)
-        st.write("scores_by_player:", scores_bp)
+        st.write("📊 當前累計分數：", daily_sum_df)
         st.write("scores_view_by_seat:", scores_view_by_seat)
 
     # ---------- B: 快速輸入面板（座位區塊下方，固定不往下滑） ----------
@@ -933,17 +1013,22 @@ def page_record(s: Settings):
             pid = s.seat_players[sel_seat]
             st.caption(f"快速輸入（已選 {s.players[pid]}）")
             qp_res = st.selectbox("結果", ["自摸", "胡牌", "流局"], key=f"qp_res_{pid}")
+
             qp_tai = 0
             if qp_res in ("自摸", "胡牌"):
                 qp_tai = st.number_input("台數", min_value=0, step=1, key=f"qp_tai_{pid}")
+
             qp_win = pid
             qp_lose = 0
             if qp_res in ("自摸", "胡牌"):
                 qp_win = st.selectbox("贏家", [0, 1, 2, 3], index=pid, format_func=lambda x: s.players[x], key=f"qp_win_{pid}")
+
             if qp_res == "胡牌":
                 lose_opts = [p for p in [0, 1, 2, 3] if p != int(qp_win)]
                 qp_lose = st.selectbox("輸家", lose_opts, format_func=lambda x: s.players[x], key=f"qp_lose_{pid}")
-            if st.button("✅ 提交", use_container_width=True, key=f"qp_submit_{pid}"):
+
+            submit_qp = st.button("✅ 提交", use_container_width=True, key=f"qp_submit_{pid}", disabled=is_game_over)
+            if submit_qp and not is_game_over:
                 if qp_res == "胡牌" and int(qp_win) == int(qp_lose):
                     st.error("胡牌時：贏家與輸家不能相同")
                 else:
@@ -961,10 +1046,12 @@ def page_record(s: Settings):
                     st.rerun()
 
     st.divider()
+
     # 🔒 座位鎖定（避免手機誤觸換位；本將進行中時座位由開始本將鎖定）
     lock_label = "🔒 鎖定座位（避免誤觸換位）" if not st.session_state.get("seat_locked", False) else "🔓 解鎖座位（可換位）"
     if mj_active:
         st.caption("本將進行中：座位已鎖定，請先『結束本將』才能換位。")
+
     if st.button(lock_label, use_container_width=True, key="record_btn_toggle_seat_lock", disabled=mj_active):
         if not mj_active:
             st.session_state["seat_locked"] = not bool(st.session_state.get("seat_locked", False))
@@ -976,6 +1063,7 @@ def page_record(s: Settings):
         st.caption("✅ 目前座位已鎖定；如要換位請先按『解鎖座位』。")
 
     st.divider()
+
     mode = st.radio("輸入類型", ["一般", "罰則"], horizontal=True, key="record_mode_radio")
 
     if mode == "一般":
@@ -983,12 +1071,11 @@ def page_record(s: Settings):
             st.session_state["record_hand_res"] = "胡牌"
         res = st.selectbox("結果", ["自摸", "胡牌", "流局"], key="record_hand_res")
 
-        # ✅ 流局不需要台數
         tai = 0
         if res in ("自摸", "胡牌"):
             tai = st.number_input("台數", min_value=0, step=1, key="record_hand_tai")
         else:
-            st.session_state["hand_tai"] = 0
+            st.session_state["record_hand_tai"] = 0
 
         win = 0
         lose = 0
@@ -996,7 +1083,6 @@ def page_record(s: Settings):
         if res in ("自摸", "胡牌"):
             win = st.selectbox("贏家", [0, 1, 2, 3], format_func=lambda x: s.players[x], key="record_hand_win")
 
-        # ✅ 胡牌時輸家下拉排除贏家
         if res == "胡牌":
             lose_options = [p for p in [0, 1, 2, 3] if p != int(win)]
             cur_lose = st.session_state.get("record_hand_lose", st.session_state.get("hand_lose", 0))
@@ -1004,8 +1090,14 @@ def page_record(s: Settings):
                 st.session_state["record_hand_lose"] = lose_options[0]
             lose = st.selectbox("輸家", lose_options, format_func=lambda x: s.players[x], key="record_hand_lose")
 
-        submit = st.button("✅ 提交結果", use_container_width=True, key="record_btn_submit_hand")
-        if submit:
+        # --- 提交按鈕區 --- #
+        submit = st.button("✅ 提交結果", use_container_width=True, key="record_btn_submit_hand", disabled=is_game_over)
+
+        if is_game_over and not st.session_state.get("_game_over_warned", False):
+            st.session_state["_game_over_warned"] = True
+            st.warning("⚠️ 本將已結束（北四局結束），錄入功能已鎖定。請封存本局或開啟新局。")
+
+        if submit and (not is_game_over):
             if res == "胡牌" and int(win) == int(lose):
                 st.error("胡牌時：贏家與輸家不能相同")
             else:
@@ -1014,13 +1106,10 @@ def page_record(s: Settings):
                     "result": "放槍" if res == "胡牌" else res,
                     "winner_id": int(win) if res in ("自摸", "胡牌") else None,
                     "loser_id": int(lose) if res == "胡牌" else None,
+                    "tai": int(tai) if res in ("自摸", "胡牌") else 0,
                 }
-                if res in ("自摸", "胡牌"):
-                    ev["tai"] = int(tai)
-
                 st.session_state.events.append(ev)
                 st.session_state["reset_hand_inputs"] = True
-
                 supabase_save(st.session_state.game_id)
                 st.rerun()
 
@@ -1034,8 +1123,13 @@ def page_record(s: Settings):
 
         amt = st.number_input("金額", min_value=0, step=50, key="record_pen_amt")
 
-        submit = st.button("🚨 提交罰則", use_container_width=True, key="record_btn_submit_pen")
-        if submit:
+        submit_pen = st.button("🚨 提交罰則", use_container_width=True, key="record_btn_submit_pen", disabled=is_game_over)
+        
+        if is_game_over and not st.session_state.get("_game_over_warned", False):
+            st.session_state["_game_over_warned"] = True
+            st.warning("⚠️ 本將已結束（北四局結束），錄入功能已鎖定。請封存本局或開啟新局。")
+        
+        if submit_pen and not is_game_over:
             ev = {
                 "_type": "penalty",
                 "p_type": pt,
@@ -1045,7 +1139,6 @@ def page_record(s: Settings):
             }
             st.session_state.events.append(ev)
             st.session_state["reset_pen_inputs"] = True
-
             supabase_save(st.session_state.game_id)
             st.rerun()
 
@@ -1055,6 +1148,7 @@ def page_record(s: Settings):
             st.session_state.events.pop()
             supabase_save(st.session_state.game_id)
             st.rerun()
+
     if c2.button("🧹 清空事件（只清本局事件）", use_container_width=True, key="record_btn_clear_events"):
         st.session_state.events = []
         st.session_state["reset_hand_inputs"] = True
@@ -1133,7 +1227,6 @@ def page_record(s: Settings):
             st.session_state.events = []
             st.session_state["reset_hand_inputs"] = True
             st.session_state["reset_pen_inputs"] = True
-            # 快速面板/鎖座位狀態也一併重置，避免下一將混亂
             st.session_state.seat_locked = False
             st.session_state.quick_actor_seat = None
             st.session_state.quick_action = None
@@ -1157,47 +1250,51 @@ def page_record(s: Settings):
 def page_overview(s: Settings):
     st.header("📊 數據總覽")
 
+    # 1. 取得本局數據 (包含修正後的 rw 值)
     ledger_df, sum_df, stats_df, rw, ds, dr, d_acc, _ = compute_game_state(s, st.session_state.events)
-    daily_sum_df = compute_daily_total(s)
+    
+    # 2. 取得今日總計 (修正換位後分數亂掉的關鍵)
+    daily_sum_df = compute_daily_total(s, cur_sum_df=sum_df)
+    daily_stats_df = compute_daily_stats(s, cur_stats_df=stats_df)
+    
+    # 合併顯示用的表格
+    daily_merged = pd.merge(daily_sum_df, daily_stats_df, on="玩家", how="left")
     merged = pd.merge(sum_df, stats_df, on="玩家", how="left")
+    
+    # 重新對應座位分數顯示 (用於 Debug 或特定 UI)
     seat_map, scores_view_by_seat = _build_scores_view(s, daily_sum_df)
 
+    # --- DEBUG 區塊 ---
     with st.expander("DEBUG Scores Mapping", expanded=False):
         gid = st.session_state.get("game_id", "")
-        scores_bp = st.session_state.get("scores_by_player", {})
         st.write("gid:", gid)
         st.write("seat_map:", seat_map)
-        st.write("scores_by_player:", scores_bp)
         st.write("scores_view_by_seat:", scores_view_by_seat)
 
-    st.subheader("當天累計總分（sessions + 本將）")
-    st.dataframe(daily_sum_df, hide_index=True, use_container_width=True)
+    # --- 第一部分：今日總結算 ---
+    st.subheader("🏆 當天累計總分（所有封存 + 本將）")
+    st.dataframe(daily_merged, hide_index=True, use_container_width=True)
 
-    st.subheader("本局：總分 + 行為統計")
+    # --- 第二部分：本局戰況 ---
+    st.subheader("📝 本局：總分 + 行為統計")
+    
+    # ✅ 修正後的安全版本：數據總覽頁面的狀態顯示
+    # rw < 4 代表還在打，rw >= 4 代表北四局結束了
+    safe_pos = f"{WINDS[min(rw, 3)]}{ds+1}局" if rw < 4 else "本將結束"
+    game_status_text = f"📌 本局狀態：{safe_pos} (連{dr})"
+    
+    st.info(f"{game_status_text} ｜ 累計東錢：${int(d_acc)}")
     st.dataframe(merged, hide_index=True, use_container_width=True)
-    st.info(f"本局目前：{WINDS[rw]}{ds+1}局 (連{dr}) ｜ 累計東錢：${int(d_acc)}")
 
+    # 本局走勢與流水帳
     if not ledger_df.empty:
-        chart_df = ledger_df.set_index("#")[s.players]
-        st.line_chart(chart_df)
-        st.dataframe(ledger_df, hide_index=True, use_container_width=True)
+        st.line_chart(ledger_df.set_index("#")[s.players])
+        with st.expander("查看本局流水帳明細"):
+            st.dataframe(ledger_df, hide_index=True, use_container_width=True)
 
-    overview_df = ledger_df
-    with st.expander("DEBUG Overview", expanded=False):
-        if overview_df.empty:
-            st.write("overview_df is empty")
-        else:
-            distinct_hand_index = sorted(overview_df["類型"].unique()) if "類型" in overview_df.columns else []
-            max_hand_index = overview_df["#"].max() if "#" in overview_df.columns else None
-            st.write("distinct_hand_index (sorted unique):", distinct_hand_index)
-            st.write("max_hand_index:", max_hand_index)
-            st.write("len(distinct_hand_index):", len(distinct_hand_index))
-            st.write("overview_df.shape:", overview_df.shape)
-            st.write("overview_df.tail(5):")
-            st.dataframe(overview_df.tail(5), hide_index=True)
-
+    # --- 第三部分：歷史牌局 (封存資料) ---
     st.divider()
-    st.subheader("已結束的牌局（封存，仍在同一個 gid）")
+    st.subheader("🗂️ 已結束的牌局（歷史紀錄）")
 
     if not st.session_state.sessions:
         st.caption("尚無封存的牌局。你可以在「牌局錄入」按『結束牌局』。")
@@ -1207,16 +1304,17 @@ def page_overview(s: Settings):
     for i, sess in enumerate(st.session_state.sessions, start=1):
         row = {
             "#": i,
-            "結束時間": sess["ended_at"],
-            "事件數": sess["event_count"],
+            "結束時間": sess.get("ended_at", ""),
+            "事件數": sess.get("event_count", 0),
             "本場東錢": sess.get("dong_total", 0),
         }
-        for r in sess["sum_df"]:
+        for r in sess.get("sum_df", []):
             row[r["玩家"]] = r["總分"]
         summary_rows.append(row)
 
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
+    # 查詢單場細節
     idx = st.number_input(
         "查看第幾場封存牌局（1=最早）",
         min_value=1,
@@ -1225,13 +1323,16 @@ def page_overview(s: Settings):
         step=1,
         key="overview_sess_idx",
     )
-    sess = st.session_state.sessions[int(idx) - 1]
-
-    st.markdown("**該場：行為統計**")
-    st.dataframe(pd.DataFrame(sess["stats_df"]), hide_index=True, use_container_width=True)
-
-    st.markdown("**該場：最後 20 筆明細（尾巴）**")
-    st.dataframe(pd.DataFrame(sess["ledger_tail"]), hide_index=True, use_container_width=True)
+    
+    target_sess = st.session_state.sessions[int(idx) - 1]
+    
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        st.markdown("**該場：行為統計**")
+        st.dataframe(pd.DataFrame(target_sess.get("stats_df", [])), hide_index=True, use_container_width=True)
+    with col_s2:
+        st.markdown("**該場：最後 5 筆明細**")
+        st.dataframe(pd.DataFrame(target_sess.get("ledger_tail", [])).tail(5), hide_index=True, use_container_width=True)
 
 
 # ============================
